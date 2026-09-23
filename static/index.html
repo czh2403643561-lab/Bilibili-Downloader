@@ -8,17 +8,16 @@
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar">
+    <header class="topbar">
       <div class="brand"><span class="brand-mark"></span><span>Bilibili Downloader</span></div>
-      <nav>
+      <nav class="top-nav">
         <button class="nav-button active" data-page="single">单视频</button>
         <button class="nav-button" data-page="up">UP 主批量</button>
-        <button class="nav-button" data-page="settings">设置</button>
       </nav>
-      <p class="sidebar-note">本地运行 · 下载文件只保存在你的电脑</p>
-    </aside>
+      <div class="top-actions"><span id="service-state" class="status-pill">检查中</span><button class="nav-button" data-page="settings">设置</button></div>
+    </header>
     <main>
-      <header><div><p class="eyebrow">本地下载工具</p><h1 id="page-title">单视频下载</h1></div><span id="service-state" class="status-pill">检查中</span></header>
+      <header><div><p class="eyebrow">本地下载工具</p><h1 id="page-title">单视频下载</h1></div></header>
 
       <section id="first-run" class="notice hidden">
         <div><strong>先选择下载目录</strong><p>首次使用需要选择一个用于保存视频和音频的文件夹。</p></div>
@@ -49,13 +48,17 @@
         </div>
         <div id="up-result" class="hidden">
           <div class="card up-profile"><img id="up-avatar" alt="UP 主头像"><div><p class="eyebrow">UP 主</p><h2 id="up-name"></h2><p id="up-total" class="muted"></p></div></div>
+          <div class="card up-tabs"><button class="up-tab active" id="up-tab-posts">投稿 <span id="up-post-count">0</span></button><button class="up-tab" id="up-tab-collections">合集和系列 <span id="up-collection-count">0</span></button></div>
+          <div id="up-posts-panel">
           <div class="card">
             <div class="up-controls"><div><label for="up-period">时间范围</label><select id="up-period"><option value="all">全部</option><option value="year">最近一年</option><option value="half_year">最近半年</option><option value="quarter">最近三个月</option></select></div><div class="up-search"><label for="up-keyword">标题搜索</label><input id="up-keyword" placeholder="输入标题关键词" autocomplete="off"></div><button class="secondary" id="up-filter-button">应用筛选</button></div>
             <div class="section-heading up-selection-heading"><div><h2>投稿列表</h2><p id="up-selected-count">已选择 0 个</p></div><div class="button-group"><button class="secondary" id="up-select-page">全选当前页</button><button class="secondary" id="up-clear-page">取消当前页</button><button class="secondary" id="up-clear-selected">清空已选</button></div></div>
-            <div id="up-list" class="up-list"></div><div id="up-empty" class="task-empty hidden">没有符合条件的公开视频投稿</div>
-            <div class="up-footer"><button class="secondary" id="up-prev">上一页</button><span id="up-page-label">第 1 页</span><button class="secondary" id="up-next">下一页</button></div>
+            <p class="up-page-summary" id="up-page-summary">共 0 个投稿 · 第 0 / 0 页</p><div id="up-list" class="up-list"></div><div id="up-empty" class="task-empty hidden">没有符合条件的公开视频投稿</div><div id="up-pagination" class="up-pagination"></div>
           </div>
           <div class="card download-options"><div><h2>批量下载格式</h2><p>每个投稿单独加入任务；多 P 默认下载全部分 P，视频最高 1080P。</p></div><div class="segmented"><label><input type="radio" name="up-mode" value="video" checked><span>视频 MP4</span></label><label><input type="radio" name="up-mode" value="audio"><span>仅音频 M4A</span></label></div><button class="primary" id="up-download-button">加入下载任务</button></div>
+          </div>
+          <div id="up-collections-panel" class="hidden"><div class="card"><div class="section-heading"><div><h2>合集和系列</h2><p id="up-collection-summary">共 0 个</p></div></div><div id="up-collection-list" class="collection-list"></div><div id="up-collection-empty" class="task-empty hidden">暂无公开合集或系列</div><div id="up-collection-pagination" class="up-pagination"></div></div></div>
+          <div id="up-detail-panel" class="hidden"><div class="card"><button class="secondary" id="up-collection-back">返回合集和系列</button><div class="section-heading collection-detail-heading"><div><p class="eyebrow" id="up-detail-kind"></p><h2 id="up-detail-name"></h2><p id="up-detail-summary" class="muted"></p></div></div><div class="section-heading up-selection-heading"><div><h2>视频列表</h2><p id="up-detail-selected-count">已选择 0 个</p></div><div class="button-group"><button class="secondary" id="up-detail-select-page">全选当前页</button><button class="secondary" id="up-detail-clear-page">取消当前页</button><button class="secondary" id="up-clear-selected-detail">清空已选</button></div></div><div id="up-detail-list" class="up-list"></div><div id="up-detail-empty" class="task-empty hidden">暂无视频</div><div id="up-detail-pagination" class="up-pagination"></div></div><div class="card download-options"><div><h2>批量下载格式</h2><p>选中的合集视频将分别加入现有下载任务。</p></div><div class="segmented"><label><input type="radio" name="collection-mode" value="video" checked><span>视频 MP4</span></label><label><input type="radio" name="collection-mode" value="audio"><span>仅音频 M4A</span></label></div><button class="primary" id="up-detail-download-button">加入下载任务</button></div></div>
         </div>
       </section>
 

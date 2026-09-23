@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import hashlib
 import logging
@@ -39,6 +40,10 @@ LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ALLOWED_COVER_SUFFIX = ".hdslb.com"
 BUILD_FILES = ("app.py", "static/index.html", "static/app.js", "static/styles.css")
 BILIBILI_SPACE_API = "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space"
+BILIBILI_ARC_SEARCH_API = "https://api.bilibili.com/x/space/wbi/arc/search"
+BILIBILI_SEASONS_API = "https://api.bilibili.com/x/polymer/web-space/seasons_series_list"
+BILIBILI_SEASON_ARCHIVES_API = "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list"
+BILIBILI_SERIES_ARCHIVES_API = "https://api.bilibili.com/x/series/archives"
 BILIBILI_PROFILE_API = "https://api.bilibili.com/x/web-interface/card"
 BILIBILI_SPACE_FEATURES = (
     "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,forwardListHidden,"
@@ -46,6 +51,8 @@ BILIBILI_SPACE_FEATURES = (
     "cardsEnhance,eva3CardOpus,eva3CardVideo,eva3CardComment,eva3CardUser"
 )
 WBI_MIXIN_KEY_TABLE = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52]
+WBI_MIXIN_KEY = ""
+UP_FILTER_CACHE: dict[tuple[str, str, str], list[dict]] = {}
 
 
 def redact(value: object) -> str:
@@ -407,21 +414,23 @@ def anonymous_cookie() -> str:
 
 
 def wbi_signed_query(params: dict) -> str:
-    status, payload = bilibili_json("https://api.bilibili.com/x/web-interface/nav")
-    data = payload.get("data") or {}
-    wbi_img = data.get("wbi_img") or {}
-    img_url = str(wbi_img.get("img_url") or "")
-    sub_url = str(wbi_img.get("sub_url") or "")
-    img_key = re.search(r"/([^/]+)\.[a-z]+$", img_url)
-    sub_key = re.search(r"/([^/]+)\.[a-z]+$", sub_url)
-    if status != 200 or not img_key or not sub_key:
-        raise ValueError("B 站安全参数暂时不可用，请稍后重试。")
-    raw_key = img_key.group(1) + sub_key.group(1)
-    mixin_key = "".join(raw_key[index] for index in WBI_MIXIN_KEY_TABLE if index < len(raw_key))[:32]
+    global WBI_MIXIN_KEY
+    if not WBI_MIXIN_KEY:
+        status, payload = bilibili_json("https://api.bilibili.com/x/web-interface/nav")
+        data = payload.get("data") or {}
+        wbi_img = data.get("wbi_img") or {}
+        img_url = str(wbi_img.get("img_url") or "")
+        sub_url = str(wbi_img.get("sub_url") or "")
+        img_key = re.search(r"/([^/]+)\.[a-z]+$", img_url)
+        sub_key = re.search(r"/([^/]+)\.[a-z]+$", sub_url)
+        if status != 200 or not img_key or not sub_key:
+            raise ValueError("B 站安全参数暂时不可用，请稍后重试。")
+        raw_key = img_key.group(1) + sub_key.group(1)
+        WBI_MIXIN_KEY = "".join(raw_key[index] for index in WBI_MIXIN_KEY_TABLE if index < len(raw_key))[:32]
     signed = {**params, "wts": int(time.time())}
     clean = {key: re.sub(r"[!'()*]", "", str(value)) for key, value in signed.items()}
     query = "&".join(f"{key}={urllib.parse.quote(clean[key], safe='')}" for key in sorted(clean))
-    return f"{query}&w_rid={hashlib.md5((query + mixin_key).encode('utf-8')).hexdigest()}"
+    return f"{query}&w_rid={hashlib.md5((query + WBI_MIXIN_KEY).encode('utf-8')).hexdigest()}"
 
 
 def up_profile(mid: str) -> dict:
@@ -515,71 +524,165 @@ def normalize_up_item(item: dict, fallback_name: str) -> dict | None:
     }
 
 
-def fetch_up_page(value: str, offset: str = "", period: str = "all", keyword: str = "", page_size: int = 30) -> dict:
+def normalize_arc_item(item: dict, fallback_name: str) -> dict | None:
+    bvid = str(item.get("bvid") or "").strip()
+    if not bvid:
+        return None
+    title = re.sub(r"<[^>]+>", "", html.unescape(str(item.get("title") or fallback_name))).strip()
+    pub_ts = int(item.get("created") or item.get("pubdate") or 0)
+    duration_text = str(item.get("length") or "")
+    return {
+        "bvid": bvid,
+        "url": f"https://www.bilibili.com/video/{bvid}",
+        "title": title or fallback_name,
+        "cover": str(item.get("pic") or "").replace("http://", "https://"),
+        "pub_ts": pub_ts,
+        "publish_time": datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d") if pub_ts else "未知时间",
+        "duration": duration_seconds(duration_text),
+        "duration_text": duration_text or "未知时长",
+    }
+
+
+def bili_error(status: int, payload: dict, action: str) -> None:
+    code = payload.get("code")
+    if status == 412 or code in {-352, -412}:
+        LOG.warning("B 站%s触发安全验证 status=%s code=%s message=%s", action, status, code, payload.get("message"))
+        raise ValueError(f"B 站暂时要求安全验证，无法{action}，请稍后重试。")
+    if code == -799:
+        raise ValueError("B 站请求过于频繁，请稍后重试。")
+    if code != 0:
+        LOG.warning("B 站%s失败 status=%s code=%s message=%s", action, status, code, payload.get("message"))
+        raise ValueError(f"B 站{action}失败，请稍后重试。")
+
+
+def fetch_arc_page(mid: str, page: int, keyword: str, page_size: int, owner_name: str) -> dict:
+    query = {
+        "mid": mid, "pn": page, "ps": page_size, "order": "pubdate", "keyword": keyword,
+        "platform": "web", "web_location": "1550101", "order_avoided": "true",
+        "dm_img_list": "[]",
+        "dm_img_str": "V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ",
+        "dm_cover_img_str": "QU5HTEUgKE5WSURJQSwgTlZJRElBIEdlRm9yY2UgUlRYIDIwNjAgKDB4MDAwMDFGMDgpIERpcmVjdDNEMTEgdnNfNV8wIHBzXzVfMCwgRDNEMTEpR29vZ2xlIEluYy4gKE5WSURJQ",
+        "dm_img_inter": json.dumps({"ds": [], "wh": [5715, 6540, 43], "of": [335, 670, 335]}, separators=(",", ":")),
+    }
+    status, payload = 0, {}
+    for attempt in range(3):
+        signed_url = BILIBILI_ARC_SEARCH_API + "?" + wbi_signed_query(query)
+        status, payload = bilibili_json(
+            signed_url,
+            referer=f"https://space.bilibili.com/{mid}/video",
+            extra_headers={"Cookie": anonymous_cookie(), "Accept": "application/json, text/plain, */*"},
+        )
+        if status != 412 and payload.get("code") not in {-352, -412, -799}:
+            break
+        if attempt < 2:
+            time.sleep(0.5 * (attempt + 1))
+    bili_error(status, payload, "获取投稿")
+    data = payload.get("data") or {}
+    page_info = data.get("page") or {}
+    items = [normalized for raw in (data.get("list") or {}).get("vlist", []) if (normalized := normalize_arc_item(raw, owner_name))]
+    count = int(page_info.get("count") or 0)
+    actual_page = int(page_info.get("pn") or page)
+    actual_size = int(page_info.get("ps") or page_size)
+    return {"items": items, "total": count, "page": actual_page, "page_size": actual_size, "total_pages": (count + actual_size - 1) // actual_size if count else 0}
+
+
+def fetch_all_arc_items(mid: str, keyword: str, page_size: int, owner_name: str) -> tuple[list[dict], int]:
+    first = fetch_arc_page(mid, 1, keyword, page_size, owner_name)
+    all_items = list(first["items"])
+    total_pages = first["total_pages"]
+    for page in range(2, total_pages + 1):
+        all_items.extend(fetch_arc_page(mid, page, keyword, page_size, owner_name)["items"])
+    unique: dict[str, dict] = {item["bvid"]: item for item in all_items}
+    return list(unique.values()), first["total"]
+
+
+def fetch_up_page(value: str, page: int = 1, period: str = "all", keyword: str = "", page_size: int = 30) -> dict:
     mid = parse_up_mid(value)
     profile = up_profile(mid)
+    page = max(1, int(page or 1))
     page_size = max(1, min(int(page_size or 30), 30))
-    cutoff = up_period_cutoff(period)
-    items: list[dict] = []
-    raw_video_count = 0
-    current_offset = offset or ""
-    seen_offsets: set[str] = set()
-    has_more = True
-    while has_more and len(items) < page_size and current_offset not in seen_offsets:
-        seen_offsets.add(current_offset)
-        query = {
-            "host_mid": mid,
-            "offset": current_offset,
-            "timezone_offset": "-480",
-            "platform": "web",
-            "features": BILIBILI_SPACE_FEATURES,
-            "web_location": "333.1387",
-            "x-bili-device-req-json": json.dumps({"platform": "web", "device": "pc", "spmid": "333.1387"}, separators=(",", ":")),
-            "dm_img_list": "[]",
-            "dm_img_str": "bm8gd2ViZ2",
-            "dm_cover_img_str": "bm8gd2ViZ2",
-            "dm_img_inter": json.dumps({"ds": [], "wh": [0, 0, 0], "of": [0, 0, 0]}, separators=(",", ":")),
-        }
-        status, payload = space_feed(query, mid)
-        code = payload.get("code")
-        if status == 412 or code in {-352, -412}:
-            raise ValueError("B 站暂时要求登录或安全验证，无法获取该 UP 主投稿。")
-        if code == -799:
-            raise ValueError("B 站请求过于频繁，请稍后重试。")
-        if code != 0:
-            LOG.warning("UP 主投稿接口失败 mid=%s code=%s message=%s", mid, code, payload.get("message"))
-            raise ValueError("获取 UP 主投稿失败，请稍后重试。")
-        data = payload.get("data") or {}
-        raw_items = data.get("items") or []
-        reached_cutoff = False
-        for raw_item in raw_items:
-            normalized = normalize_up_item(raw_item, profile["name"])
-            if not normalized:
+    keyword = keyword.strip()
+    period = period if period in {"all", "year", "half_year", "quarter"} else "all"
+    if period == "all":
+        result = fetch_arc_page(mid, page, keyword, page_size, profile["name"])
+        profile["total"] = result["total"]
+        return {"profile": profile, "items": result["items"], "total": result["total"], "page": result["page"], "page_size": result["page_size"], "total_pages": result["total_pages"], "source": "arc"}
+    cache_key = (mid, period, keyword.casefold())
+    if cache_key not in UP_FILTER_CACHE:
+        all_items, _ = fetch_all_arc_items(mid, keyword, page_size, profile["name"])
+        cutoff = up_period_cutoff(period) or 0
+        UP_FILTER_CACHE[cache_key] = [item for item in all_items if not item["pub_ts"] or item["pub_ts"] >= cutoff]
+    filtered = UP_FILTER_CACHE[cache_key]
+    total = len(filtered)
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    start = (page - 1) * page_size
+    profile["total"] = total
+    return {"profile": profile, "items": filtered[start:start + page_size], "total": total, "page": page, "page_size": page_size, "total_pages": total_pages, "source": "arc-filtered"}
+
+
+def normalize_archive_item(item: dict, fallback_name: str) -> dict | None:
+    normalized = normalize_arc_item(item, fallback_name)
+    if normalized:
+        normalized["duration"] = int(item.get("duration") or normalized["duration"] or 0)
+        normalized["duration_text"] = format_duration(normalized["duration"])
+    return normalized
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}" if seconds >= 3600 else f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def fetch_collections(value: str, page: int = 1, page_size: int = 30) -> dict:
+    mid = parse_up_mid(value)
+    profile = up_profile(mid)
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 30), 20))
+    query = {"mid": mid, "page_num": page, "page_size": page_size, "web_location": "333.999"}
+    status, payload = bilibili_json(BILIBILI_SEASONS_API + "?" + urllib.parse.urlencode(query), referer=f"https://space.bilibili.com/{mid}/video")
+    bili_error(status, payload, "获取合集和系列")
+    data = payload.get("data") or {}
+    lists = data.get("items_lists") or {}
+    page_info = lists.get("page") or {}
+    items = []
+    for kind, raw_items in (("season", lists.get("seasons_list") or []), ("series", lists.get("series_list") or [])):
+        for raw in raw_items:
+            meta = raw.get("meta") or raw
+            collection_id = str(meta.get("season_id") if kind == "season" else meta.get("series_id") or meta.get("id") or "")
+            if not collection_id:
                 continue
-            raw_video_count += 1
-            if cutoff and normalized["pub_ts"] and normalized["pub_ts"] < cutoff:
-                reached_cutoff = True
-                continue
-            if keyword and keyword.casefold() not in normalized["title"].casefold():
-                continue
-            items.append(normalized)
-            if len(items) >= page_size:
-                break
-        next_offset = str(data.get("offset") or "")
-        has_more = bool(data.get("has_more")) and bool(next_offset) and next_offset != current_offset and not reached_cutoff
-        current_offset = next_offset
-        if reached_cutoff:
-            has_more = False
-    if not items and not keyword and not cutoff and profile["total"] > 0 and raw_video_count == 0:
-        LOG.warning("B 站投稿接口返回空列表 mid=%s profile_total=%s", mid, profile["total"])
-        raise ValueError("B 站暂时没有返回该 UP 主的公开投稿，请稍后重试。")
-    return {
-        "profile": profile,
-        "items": items,
-        "next_offset": current_offset if has_more else "",
-        "has_more": has_more,
-        "total": profile["total"],
-    }
+            items.append({"kind": kind, "id": collection_id, "name": meta.get("name") or meta.get("title") or "未命名合集", "cover": str(meta.get("cover") or "").replace("http://", "https://"), "total": int(meta.get("total") or 0)})
+    total = int(page_info.get("total") or len(items))
+    actual_size = int(page_info.get("page_size") or page_size)
+    actual_page = int(page_info.get("page_num") or page)
+    profile["collection_total"] = total
+    return {"profile": profile, "items": items, "total": total, "page": actual_page, "page_size": actual_size, "total_pages": (total + actual_size - 1) // actual_size if total else 0}
+
+
+def fetch_collection_detail(value: str, kind: str, collection_id: str, page: int = 1, page_size: int = 30) -> dict:
+    mid = parse_up_mid(value)
+    profile = up_profile(mid)
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 30), 30))
+    if kind == "season":
+        query = {"mid": mid, "season_id": collection_id, "sort_reverse": "false", "page_num": page, "page_size": page_size, "web_location": "333.999"}
+        endpoint = BILIBILI_SEASON_ARCHIVES_API
+    elif kind == "series":
+        query = {"mid": mid, "series_id": collection_id, "only_normal": "true", "sort": "desc", "pn": page, "ps": page_size}
+        endpoint = BILIBILI_SERIES_ARCHIVES_API
+    else:
+        raise ValueError("合集类型不正确，请重新打开合集列表。")
+    status, payload = bilibili_json(endpoint + "?" + urllib.parse.urlencode(query), referer=f"https://space.bilibili.com/{mid}/video")
+    bili_error(status, payload, "获取合集视频")
+    data = payload.get("data") or {}
+    raw_page = data.get("page") or {}
+    archives = data.get("archives") or []
+    items = [normalized for raw in archives if (normalized := normalize_archive_item(raw, profile["name"]))]
+    total = int(raw_page.get("total") or len(data.get("aids") or archives))
+    actual_size = int(raw_page.get("page_size") or raw_page.get("ps") or page_size)
+    actual_page = int(raw_page.get("page_num") or raw_page.get("pn") or page)
+    meta = data.get("meta") or {}
+    return {"profile": profile, "collection": {"kind": kind, "id": collection_id, "name": meta.get("name") or meta.get("title") or "合集视频"}, "items": items, "total": total, "page": actual_page, "page_size": actual_size, "total_pages": (total + actual_size - 1) // actual_size if total else 0}
 
 
 def short_error(value: object) -> str:
@@ -679,9 +782,23 @@ class Handler(SimpleHTTPRequestHandler):
             elif path == "/api/up":
                 self.send_json(fetch_up_page(
                     str(data.get("input", "")).strip(),
-                    str(data.get("offset", "")).strip(),
+                    int(data.get("page", 1) or 1),
                     str(data.get("period", "all")).strip(),
                     str(data.get("keyword", "")).strip(),
+                    int(data.get("page_size", 30) or 30),
+                ))
+            elif path == "/api/up/collections":
+                self.send_json(fetch_collections(
+                    str(data.get("input", "")).strip(),
+                    int(data.get("page", 1) or 1),
+                    int(data.get("page_size", 30) or 30),
+                ))
+            elif path == "/api/up/collection":
+                self.send_json(fetch_collection_detail(
+                    str(data.get("input", "")).strip(),
+                    str(data.get("kind", "")).strip(),
+                    str(data.get("collection_id", "")).strip(),
+                    int(data.get("page", 1) or 1),
                     int(data.get("page_size", 30) or 30),
                 ))
             elif path == "/api/shutdown":

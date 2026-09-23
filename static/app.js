@@ -1,4 +1,4 @@
-const state = { video: null, online: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), up: { input: '', profile: null, items: [], selected: {}, page: 1, offsets: [''], hasMore: false, period: 'all', keyword: '', loading: false } };
+const state = { video: null, online: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, detail: null } };
 const $ = (selector) => document.querySelector(selector);
 const PLACEHOLDER_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="328" height="184" viewBox="0 0 328 184"><rect width="328" height="184" fill="#eef0f4"/><path d="M132 78h64v28h-64z" fill="#c5ccd7"/><circle cx="148" cy="88" r="5" fill="#eef0f4"/><path d="m139 101 15-14 10 9 11-12 14 17z" fill="#eef0f4"/><text x="164" y="132" text-anchor="middle" fill="#8d98a8" font-size="14">封面暂时无法加载</text></svg>')}`;
 
@@ -51,82 +51,93 @@ function renderVideo(video) {
   $('#video-result').classList.remove('hidden');
 }
 
-function renderUp() {
-  const up = state.up;
-  if (!up.profile) { $('#up-result').classList.add('hidden'); return; }
-  $('#up-result').classList.remove('hidden');
-  const avatar = $('#up-avatar');
-  avatar.onerror = () => { avatar.onerror = null; avatar.src = PLACEHOLDER_COVER; };
-  avatar.src = up.profile.face ? `/api/cover?url=${encodeURIComponent(up.profile.face)}` : PLACEHOLDER_COVER;
-  $('#up-name').textContent = up.profile.name;
-  $('#up-total').textContent = `公开视频投稿约 ${up.profile.total} 个`;
-  $('#up-selected-count').textContent = `已选择 ${Object.keys(up.selected).length} 个`;
-  $('#up-list').innerHTML = up.items.map((item) => `<label class="up-item"><input type="checkbox" data-up-id="${escapeHtml(item.bvid)}" ${up.selected[item.bvid] ? 'checked' : ''}><img class="up-cover" alt="视频封面" src="/api/cover?url=${encodeURIComponent(item.cover)}"><span class="up-item-main"><strong>${escapeHtml(item.title)}</strong><span class="up-item-meta">${escapeHtml(item.publish_time)} · ${escapeHtml(item.duration_text)}</span></span></label>`).join('');
-  $('#up-list').querySelectorAll('.up-cover').forEach((image) => { image.onerror = () => { image.onerror = null; image.src = PLACEHOLDER_COVER; }; });
-  $('#up-empty').classList.toggle('hidden', up.items.length > 0);
-  $('#up-page-label').textContent = `第 ${up.page} 页`;
-  $('#up-prev').disabled = up.page <= 1 || up.loading;
-  $('#up-next').disabled = !up.hasMore || up.loading;
-  $('#up-download-button').disabled = !Object.keys(up.selected).length || up.loading;
-}
-
-async function loadUpPage(reset = false) {
-  const up = state.up;
-  if (up.loading || (!reset && up.page > 1 && !up.offsets[up.page - 1])) return;
-  if (reset) { up.page = 1; up.offsets = ['']; up.items = []; up.profile = null; }
-  up.loading = true;
-  const message = $('#up-message'); message.textContent = '正在获取投稿…';
-  renderUp();
-  try {
-    const result = await api('/api/up', { method: 'POST', timeoutMs: 30000, body: JSON.stringify({ input: up.input, offset: up.offsets[up.page - 1] || '', period: up.period, keyword: up.keyword, page_size: 30 }) });
-    up.profile = result.profile; up.items = result.items || []; up.hasMore = Boolean(result.has_more); up.offsets[up.page] = result.next_offset || '';
-    message.textContent = up.items.length ? '' : '没有符合条件的公开视频投稿。';
-  } catch (error) { message.textContent = error.message; up.items = []; up.hasMore = false; }
-  finally { up.loading = false; renderUp(); }
-}
-
-async function parseUp() {
-  const input = $('#up-url').value.trim();
-  if (!input) { $('#up-message').textContent = '请输入 UP 主主页链接或 mid。'; return; }
-  if (state.up.input && state.up.input !== input) state.up.selected = {};
-  state.up.input = input; state.up.period = $('#up-period').value; state.up.keyword = $('#up-keyword').value.trim();
-  $('#up-parse-button').disabled = true;
-  try { await loadUpPage(true); } finally { $('#up-parse-button').disabled = false; }
-}
-
 async function applyUpFilter() {
   if (!state.up.input) { $('#up-message').textContent = '请先获取 UP 主投稿。'; return; }
   state.up.period = $('#up-period').value; state.up.keyword = $('#up-keyword').value.trim(); await loadUpPage(true);
 }
 
+async function parseUp() {
+  const input = $('#up-url').value.trim(); if (!input) { $('#up-message').textContent = '请输入 UP 主主页链接或 mid。'; return; }
+  if (state.up.input && state.up.input !== input) state.up.selected = {};
+  state.up.input = input; state.up.period = $('#up-period').value; state.up.keyword = $('#up-keyword').value.trim(); state.up.collections = []; state.up.collectionTotal = 0; state.up.detail = null;
+  $('#up-parse-button').disabled = true;
+  try { await loadUpPage(true); if (state.up.profile) await loadCollections(true); } finally { $('#up-parse-button').disabled = false; }
+}
+
+function renderUpItemList(containerId, emptyId, items) {
+  const container = $(`#${containerId}`);
+  container.innerHTML = items.map((item) => `<label class="up-item"><input type="checkbox" data-up-id="${escapeHtml(item.bvid)}" ${state.up.selected[item.bvid] ? 'checked' : ''}><img class="up-cover" alt="视频封面" src="/api/cover?url=${encodeURIComponent(item.cover || '')}"><span class="up-item-main"><strong>${escapeHtml(item.title)}</strong><span class="up-item-meta">${escapeHtml(item.publish_time)} · ${escapeHtml(item.duration_text)}</span></span></label>`).join('');
+  container.querySelectorAll('.up-cover').forEach((image) => { image.onerror = () => { image.onerror = null; image.src = PLACEHOLDER_COVER; }; });
+  $(`#${emptyId}`).classList.toggle('hidden', items.length > 0);
+}
+
+function renderPagination(containerId, page, totalPages, onPage) {
+  const container = $(`#${containerId}`);
+  if (!totalPages) { container.innerHTML = ''; return; }
+  const pages = [];
+  const add = (value) => { if (!pages.includes(value)) pages.push(value); };
+  add(1); add(totalPages); for (let value = Math.max(1, page - 2); value <= Math.min(totalPages, page + 2); value += 1) add(value);
+  pages.sort((a, b) => a - b);
+  const parts = []; let previous = 0;
+  pages.forEach((value) => { if (previous && value - previous > 1) parts.push('<span class="pagination-gap">…</span>'); parts.push(`<button class="secondary page-button ${value === page ? 'active' : ''}" data-page="${value}">${value}</button>`); previous = value; });
+  container.innerHTML = `<button class="secondary page-button" data-page="${Math.max(1, page - 1)}" ${page <= 1 ? 'disabled' : ''}>上一页</button>${parts.join('')}<button class="secondary page-button" data-page="${Math.min(totalPages, page + 1)}" ${page >= totalPages ? 'disabled' : ''}>下一页</button>`;
+  container.querySelectorAll('.page-button:not(:disabled)').forEach((button) => button.addEventListener('click', () => onPage(Number(button.dataset.page))));
+}
+
+function renderUp() {
+  const up = state.up;
+  if (!up.profile) { $('#up-result').classList.add('hidden'); return; }
+  $('#up-result').classList.remove('hidden');
+  const avatar = $('#up-avatar'); avatar.onerror = () => { avatar.onerror = null; avatar.src = PLACEHOLDER_COVER; }; avatar.src = up.profile.face ? `/api/cover?url=${encodeURIComponent(up.profile.face)}` : PLACEHOLDER_COVER;
+  $('#up-name').textContent = up.profile.name; $('#up-total').textContent = `投稿 ${up.profile.total} 个 · 当前筛选 ${up.total} 个`;
+  $('#up-post-count').textContent = up.total; $('#up-collection-count').textContent = up.collectionTotal || '—'; $('#up-selected-count').textContent = `已选择 ${Object.keys(up.selected).length} 个`;
+  $('#up-tab-posts').classList.toggle('active', up.tab === 'posts'); $('#up-tab-collections').classList.toggle('active', up.tab === 'collections');
+  $('#up-page-summary').textContent = `共 ${up.total} 个投稿 · 第 ${up.totalPages ? up.page : 0} / ${up.totalPages || 0} 页`;
+  renderUpItemList('up-list', 'up-empty', up.items); renderPagination('up-pagination', up.page, up.totalPages, async (page) => { up.page = page; await loadUpPage(); });
+  $('#up-download-button').disabled = !Object.keys(up.selected).length || up.loading;
+  $('#up-posts-panel').classList.toggle('hidden', up.tab !== 'posts'); $('#up-collections-panel').classList.toggle('hidden', up.tab !== 'collections' || Boolean(up.detail)); $('#up-detail-panel').classList.toggle('hidden', up.tab !== 'detail');
+  if (up.detail) { $('#up-detail-kind').textContent = up.detail.kind === 'series' ? '系列' : '合集'; $('#up-detail-name').textContent = up.detail.name; $('#up-detail-summary').textContent = `共 ${up.detail.total} 个视频 · 第 ${up.detail.totalPages ? up.detail.page : 0} / ${up.detail.totalPages || 0} 页`; $('#up-detail-selected-count').textContent = `已选择 ${Object.keys(up.selected).length} 个`; renderUpItemList('up-detail-list', 'up-detail-empty', up.detail.items); renderPagination('up-detail-pagination', up.detail.page, up.detail.totalPages, async (page) => { await loadCollectionDetail(page); }); $('#up-detail-download-button').disabled = !Object.keys(up.selected).length || up.detail.loading; }
+  renderCollections();
+}
+
+function renderCollections() {
+  const up = state.up; const container = $('#up-collection-list'); if (!container) return;
+  container.innerHTML = up.collections.map((item) => `<button class="collection-item" data-collection-kind="${escapeHtml(item.kind)}" data-collection-id="${escapeHtml(item.id)}"><img class="collection-cover" alt="合集封面" src="/api/cover?url=${encodeURIComponent(item.cover || '')}"><span class="collection-main"><strong>${escapeHtml(item.name)}</strong><span>${item.kind === 'series' ? '系列' : '合集'} · ${item.total} 个视频</span></span></button>`).join('');
+  container.querySelectorAll('.collection-cover').forEach((image) => { image.onerror = () => { image.onerror = null; image.src = PLACEHOLDER_COVER; }; });
+  container.querySelectorAll('.collection-item').forEach((button) => button.addEventListener('click', () => loadCollectionDetail(1, button.dataset.collectionKind, button.dataset.collectionId)));
+  $('#up-collection-empty').classList.toggle('hidden', up.collections.length > 0);
+  $('#up-collection-summary').textContent = `共 ${up.collectionTotal} 个合集和系列 · 第 ${up.collectionTotalPages ? up.collectionPage : 0} / ${up.collectionTotalPages || 0} 页`;
+  renderPagination('up-collection-pagination', up.collectionPage, up.collectionTotalPages, async (page) => { up.collectionPage = page; await loadCollections(); });
+}
+
+async function loadUpPage(reset = false) {
+  const up = state.up; if (up.loading) return; if (reset) { up.page = 1; up.items = []; up.profile = null; up.total = 0; up.totalPages = 0; up.detail = null; }
+  up.loading = true; $('#up-message').textContent = '正在获取投稿…'; renderUp();
+  try { const result = await api('/api/up', { method: 'POST', timeoutMs: 60000, body: JSON.stringify({ input: up.input, page: up.page, period: up.period, keyword: up.keyword, page_size: 30 }) }); up.profile = result.profile; up.items = result.items || []; up.total = Number(result.total || 0); up.totalPages = Number(result.total_pages || 0); up.page = Number(result.page || up.page); $('#up-message').textContent = up.items.length ? '' : '没有符合条件的公开视频投稿。'; }
+  catch (error) { $('#up-message').textContent = error.message; up.items = []; up.total = 0; up.totalPages = 0; }
+  finally { up.loading = false; renderUp(); if (up.items.length) $('#up-list').scrollIntoView({ block: 'start' }); }
+}
+
+async function loadCollections(reset = false) {
+  const up = state.up; if (up.collectionLoading) return; if (reset) { up.collectionPage = 1; up.collections = []; up.collectionTotal = 0; up.collectionTotalPages = 0; }
+  up.collectionLoading = true; $('#up-message').textContent = '正在获取合集和系列…'; renderUp();
+  try { const result = await api('/api/up/collections', { method: 'POST', timeoutMs: 30000, body: JSON.stringify({ input: up.input, page: up.collectionPage, page_size: 30 }) }); up.profile = { ...up.profile, ...result.profile, total: up.total || result.profile.total }; up.collections = result.items || []; up.collectionTotal = Number(result.total || 0); up.collectionTotalPages = Number(result.total_pages || 0); up.collectionPage = Number(result.page || up.collectionPage); $('#up-message').textContent = ''; }
+  catch (error) { $('#up-message').textContent = error.message; up.collections = []; up.collectionTotal = 0; up.collectionTotalPages = 0; }
+  finally { up.collectionLoading = false; renderUp(); }
+}
+
+async function loadCollectionDetail(page = 1, kind = state.up.detail?.kind, collectionId = state.up.detail?.id) {
+  const up = state.up; if (!kind || !collectionId) return; up.tab = 'detail'; up.detail = { kind, id: collectionId, name: '正在加载…', items: [], total: 0, page, totalPages: 0, loading: true }; renderUp();
+  try { const result = await api('/api/up/collection', { method: 'POST', timeoutMs: 30000, body: JSON.stringify({ input: up.input, kind, collection_id: collectionId, page, page_size: 30 }) }); up.profile = { ...up.profile, ...result.profile, total: up.total || result.profile.total }; up.detail = { ...result.collection, items: result.items || [], total: Number(result.total || 0), page: Number(result.page || page), totalPages: Number(result.total_pages || 0), loading: false }; $('#up-message').textContent = ''; }
+  catch (error) { up.detail.loading = false; $('#up-message').textContent = error.message; }
+  finally { renderUp(); if (up.detail && up.detail.items.length) $('#up-detail-list').scrollIntoView({ block: 'start' }); }
+}
+
 function selectUpPage() { state.up.items.forEach((item) => { state.up.selected[item.bvid] = item; }); renderUp(); }
 function clearUpPage() { state.up.items.forEach((item) => { delete state.up.selected[item.bvid]; }); renderUp(); }
 function clearUpSelected() { state.up.selected = {}; renderUp(); }
-function changeUpSelection(event) {
-  const input = event.target;
-  if (!input.dataset.upId) return;
-  const item = state.up.items.find((candidate) => candidate.bvid === input.dataset.upId);
-  if (!item) return;
-  if (input.checked) state.up.selected[item.bvid] = item; else delete state.up.selected[item.bvid];
-  renderUp();
-}
-async function startUpBatch() {
-  const selected = Object.values(state.up.selected);
-  if (!selected.length) { $('#up-message').textContent = '请至少选择一个投稿。'; return; }
-  const mode = document.querySelector('input[name="up-mode"]:checked').value;
-  const button = $('#up-download-button'); button.disabled = true;
-  let added = 0;
-  for (let index = 0; index < selected.length; index += 1) {
-    $('#up-message').textContent = `正在加入第 ${index + 1}/${selected.length} 个任务…`;
-    try {
-      const task = await api('/api/tasks', { method: 'POST', body: JSON.stringify({ url: selected[index].url, pages: [], all_pages: true, mode }) });
-      state.taskOptions[task.id] = { url: selected[index].url, pages: [], all_pages: true, mode }; added += 1;
-    } catch (error) { $('#up-message').textContent = `已加入 ${added} 个，部分任务失败：${error.message}`; }
-  }
-  localStorage.setItem('bbdown-task-options', JSON.stringify(state.taskOptions));
-  if (added === selected.length) $('#up-message').textContent = `已加入 ${added} 个下载任务。`;
-  await refreshTasks(); renderUp();
-}
+function changeUpSelection(event) { const input = event.target; if (!input.dataset.upId) return; const items = state.up.detail ? state.up.detail.items : state.up.items; const item = items.find((candidate) => candidate.bvid === input.dataset.upId); if (!item) return; if (input.checked) state.up.selected[item.bvid] = item; else delete state.up.selected[item.bvid]; renderUp(); }
+async function startSelectedBatch(mode, buttonId) { const selected = Object.values(state.up.selected); if (!selected.length) { $('#up-message').textContent = '请至少选择一个视频。'; return; } const button = $(`#${buttonId}`); button.disabled = true; let added = 0; for (const item of selected) { try { const task = await api('/api/tasks', { method: 'POST', body: JSON.stringify({ url: item.url, pages: [], all_pages: true, mode }) }); state.taskOptions[task.id] = { url: item.url, pages: [], all_pages: true, mode }; added += 1; } catch (error) { $('#up-message').textContent = `已加入 ${added} 个，部分任务失败：${error.message}`; break; } } localStorage.setItem('bbdown-task-options', JSON.stringify(state.taskOptions)); if (added === selected.length) $('#up-message').textContent = `已加入 ${added} 个下载任务。`; await refreshTasks(); button.disabled = false; renderUp(); }
 
 async function parseVideo() {
   const value = $('#video-url').value.trim(); const message = $('#parse-message');
@@ -196,7 +207,14 @@ function bindEvents() {
   $('#task-list').addEventListener('click', (event) => { const target = event.target; if (target.dataset.stop) stopTask(target.dataset.stop); if (target.dataset.retry) retryTask(target.dataset.retry); });
   $('#up-parse-button').addEventListener('click', parseUp); $('#up-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseUp(); });
   $('#up-filter-button').addEventListener('click', applyUpFilter); $('#up-select-page').addEventListener('click', selectUpPage); $('#up-clear-page').addEventListener('click', clearUpPage); $('#up-clear-selected').addEventListener('click', clearUpSelected);
-  $('#up-list').addEventListener('change', changeUpSelection); $('#up-prev').addEventListener('click', async () => { if (state.up.page > 1) { state.up.page -= 1; await loadUpPage(); } }); $('#up-next').addEventListener('click', async () => { if (state.up.hasMore) { state.up.page += 1; await loadUpPage(); } });
-  $('#up-download-button').addEventListener('click', startUpBatch);
+  $('#up-list').addEventListener('change', changeUpSelection); $('#up-detail-list').addEventListener('change', changeUpSelection);
+  $('#up-download-button').addEventListener('click', () => startSelectedBatch(document.querySelector('input[name="up-mode"]:checked').value, 'up-download-button'));
+  $('#up-detail-download-button').addEventListener('click', () => startSelectedBatch(document.querySelector('input[name="collection-mode"]:checked').value, 'up-detail-download-button'));
+  $('#up-tab-posts').addEventListener('click', async () => { state.up.tab = 'posts'; state.up.detail = null; renderUp(); });
+  $('#up-tab-collections').addEventListener('click', async () => { state.up.tab = 'collections'; state.up.detail = null; renderUp(); if (!state.up.collections.length) await loadCollections(true); });
+  $('#up-collection-back').addEventListener('click', () => { state.up.tab = 'collections'; state.up.detail = null; renderUp(); });
+  $('#up-detail-select-page').addEventListener('click', () => { (state.up.detail?.items || []).forEach((item) => { state.up.selected[item.bvid] = item; }); renderUp(); });
+  $('#up-detail-clear-page').addEventListener('click', () => { (state.up.detail?.items || []).forEach((item) => delete state.up.selected[item.bvid]); renderUp(); });
+  $('#up-clear-selected-detail').addEventListener('click', clearUpSelected);
 }
 setupNavigation(); bindEvents(); refreshHealth(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000);
