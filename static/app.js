@@ -1,13 +1,15 @@
-const state = { video: null, online: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}') };
+const state = { video: null, online: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}') };
 const $ = (selector) => document.querySelector(selector);
+const PLACEHOLDER_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="328" height="184" viewBox="0 0 328 184"><rect width="328" height="184" fill="#eef0f4"/><path d="M132 78h64v28h-64z" fill="#c5ccd7"/><circle cx="148" cy="88" r="5" fill="#eef0f4"/><path d="m139 101 15-14 10 9 11-12 14 17z" fill="#eef0f4"/><text x="164" y="132" text-anchor="middle" fill="#8d98a8" font-size="14">封面暂时无法加载</text></svg>')}`;
 
 async function api(path, options = {}) {
   let response;
+  const { timeoutMs = 5000, ...fetchOptions } = options;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
-  try { response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, signal: controller.signal, ...options }); }
-  catch (_) { setOffline(); throw new Error('本地服务已断开，请重新启动工具。'); }
-  finally { clearTimeout(timeout); }
+  const timeout = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try { response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, signal: controller.signal, ...fetchOptions }); }
+  catch (_) { if (!state.directorySelecting) setOffline(); throw new Error('本地服务已断开，请重新启动工具。'); }
+  finally { if (timeout) clearTimeout(timeout); }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || '请求失败，请稍后重试。');
   return data;
@@ -29,6 +31,7 @@ function setServiceState(health) {
 }
 
 function setOffline() {
+  if (state.directorySelecting) return;
   state.online = false;
   const badge = $('#service-state');
   badge.textContent = '本地服务已断开，请重新启动工具';
@@ -39,7 +42,9 @@ async function refreshHealth() { try { setServiceState(await api('/api/health'))
 
 function renderVideo(video) {
   state.video = video;
-  $('#video-cover').src = video.cover;
+  const cover = $('#video-cover');
+  cover.onerror = () => { cover.onerror = null; cover.src = PLACEHOLDER_COVER; };
+  cover.src = `/api/cover?url=${encodeURIComponent(video.cover)}`;
   $('#video-title').textContent = video.title;
   $('#video-owner').textContent = `UP 主：${video.owner}`;
   $('#page-list').innerHTML = video.pages.map((page) => `<label class="page-item"><input type="checkbox" value="${page.page}" checked><span class="page-number">P${page.page}</span><span class="page-name">${escapeHtml(page.title)}</span><span class="page-duration">${formatDuration(page.duration)}</span></label>`).join('');
@@ -85,13 +90,23 @@ function taskHtml(task) {
   return `<article class="task"><div class="task-top"><span class="task-name">${escapeHtml(task.title || task.url)}</span><span class="task-status ${failed ? 'failed' : task.isSuccessful ? 'done' : ''}">${status}</span><span class="task-actions">${actions}</span></div><div class="task-progress"><span style="width:${task.isSuccessful ? 100 : progress}%"></span></div><div class="task-meta"><span>进度：${task.isSuccessful ? 100 : progress}%</span><span>${formatSpeed(task.downloadSpeed)}</span></div>${failed && task.errorMessage ? `<div class="task-error">${escapeHtml(task.errorMessage)}</div>` : ''}</article>`;
 }
 async function refreshTasks() {
-  if (!state.online) return;
+  if (!state.online || state.directorySelecting) return;
   try {
     const snapshot = await api('/api/tasks'); const tasks = [...(snapshot.running || []), ...(snapshot.finished || [])];
     $('#task-list').innerHTML = tasks.length ? tasks.map(taskHtml).join('') : '<div class="task-empty">暂无下载任务</div>';
   } catch (error) { $('#task-list').innerHTML = `<div class="task-empty">${escapeHtml(error.message)}</div>`; }
 }
-async function chooseDirectory() { try { const result = await api('/api/select-directory', { method: 'POST', body: '{}' }); if (!result.cancelled) { await refreshHealth(); await refreshTasks(); if (result.error) alert(result.error); } } catch (error) { alert(error.message); } }
+async function chooseDirectory() {
+  if (state.directorySelecting) return;
+  state.directorySelecting = true;
+  const buttons = [$('#choose-first-dir'), $('#choose-dir')].filter(Boolean);
+  buttons.forEach((button) => { button.disabled = true; button.dataset.originalText = button.textContent; button.textContent = '请选择目录…'; });
+  try {
+    const result = await api('/api/select-directory', { method: 'POST', body: '{}', timeoutMs: 0 });
+    if (!result.cancelled) { await refreshHealth(); await refreshTasks(); if (result.error) alert(result.error); }
+  } catch (error) { alert(error.message); }
+  finally { state.directorySelecting = false; buttons.forEach((button) => { button.disabled = false; button.textContent = button.dataset.originalText; }); }
+}
 async function simpleAction(path) { try { await api(path, { method: 'POST', body: '{}' }); } catch (error) { alert(error.message); } }
 
 function setupNavigation() { document.querySelectorAll('.nav-button').forEach((button) => button.addEventListener('click', () => { document.querySelectorAll('.nav-button').forEach((item) => item.classList.remove('active')); document.querySelectorAll('.page').forEach((item) => item.classList.add('hidden')); button.classList.add('active'); $(`#page-${button.dataset.page}`).classList.remove('hidden'); $('#page-title').textContent = ({ single: '单视频下载', up: 'UP 主批量下载', settings: '设置' }[button.dataset.page]); })); }

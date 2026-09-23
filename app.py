@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+from ctypes import wintypes
 import json
+import hashlib
 import logging
 import os
 import re
@@ -35,6 +38,21 @@ CONFIG_FILE = APP_DATA / "config.json"
 LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ALLOWED_COVER_SUFFIX = ".hdslb.com"
+
+
+if os.name == "nt":
+    class BrowseInfo(ctypes.Structure):
+        _fields_ = [
+            ("hwndOwner", wintypes.HWND),
+            ("pidlRoot", ctypes.c_void_p),
+            ("pszDisplayName", wintypes.LPWSTR),
+            ("lpszTitle", wintypes.LPCWSTR),
+            ("ulFlags", wintypes.UINT),
+            ("lpfn", ctypes.c_void_p),
+            ("lParam", wintypes.LPARAM),
+            ("iImage", ctypes.c_int),
+        ]
 
 
 def redact(value: object) -> str:
@@ -97,6 +115,83 @@ def save_config(config: dict) -> None:
 def run_hidden(command: list[str], **kwargs) -> subprocess.Popen:
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return subprocess.Popen(command, creationflags=flags, **kwargs)
+
+
+def select_folder() -> str:
+    """使用 Windows 原生目录选择器，不启动 PowerShell，不阻塞主服务。"""
+    if os.name != "nt":
+        raise RuntimeError("当前系统不支持 Windows 文件夹选择器。")
+    shell32 = ctypes.windll.shell32
+    user32 = ctypes.windll.user32
+    ole32 = ctypes.windll.ole32
+    display_name = ctypes.create_unicode_buffer(260)
+    flags = 0x0001 | 0x0010 | 0x0040  # RETURNONLYFSDIRS + EDITBOX + NEWDIALOGSTYLE
+    info = BrowseInfo(
+        hwndOwner=user32.GetForegroundWindow(),
+        pidlRoot=None,
+        pszDisplayName=ctypes.cast(display_name, wintypes.LPWSTR),
+        lpszTitle="选择默认下载目录",
+        ulFlags=flags,
+        lpfn=None,
+        lParam=0,
+        iImage=0,
+    )
+    shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+    selected = shell32.SHBrowseForFolderW(ctypes.byref(info))
+    if not selected:
+        return ""
+    try:
+        path = ctypes.create_unicode_buffer(32768)
+        if shell32.SHGetPathFromIDListW(selected, path):
+            return path.value
+        return ""
+    finally:
+        ole32.CoTaskMemFree(selected)
+
+
+def allowed_cover_url(value: str) -> bool:
+    parsed = urllib.parse.urlparse(value)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return parsed.scheme in {"http", "https"} and (host == "hdslb.com" or host.endswith(ALLOWED_COVER_SUFFIX))
+
+
+class CoverRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        if not allowed_cover_url(newurl):
+            raise ValueError("封面地址跳转到了不受支持的域名。")
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+
+def get_cover(value: str) -> tuple[bytes, str]:
+    if not allowed_cover_url(value):
+        raise ValueError("封面地址不是受支持的 B 站图片地址。")
+    cache_dir = APP_DATA / "cover-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    cache_file = cache_dir / f"{key}.bin"
+    meta_file = cache_dir / f"{key}.json"
+    if cache_file.exists() and meta_file.exists():
+        try:
+            return cache_file.read_bytes(), json.loads(meta_file.read_text(encoding="utf-8"))["content_type"]
+        except (OSError, KeyError, json.JSONDecodeError):
+            cache_file.unlink(missing_ok=True)
+            meta_file.unlink(missing_ok=True)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), CoverRedirectHandler())
+    request = urllib.request.Request(value, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"})
+    with opener.open(request, timeout=15) as response:
+        if not allowed_cover_url(response.geturl()):
+            raise ValueError("封面地址跳转到了不受支持的域名。")
+        content_type = response.headers.get_content_type()
+        if not content_type.startswith("image/"):
+            raise ValueError("B 站返回的封面不是图片。")
+        body = response.read(5 * 1024 * 1024 + 1)
+    if len(body) > 5 * 1024 * 1024:
+        raise ValueError("封面文件过大。")
+    temporary = cache_file.with_suffix(".tmp")
+    temporary.write_bytes(body)
+    temporary.replace(cache_file)
+    meta_file.write_text(json.dumps({"content_type": content_type}), encoding="utf-8")
+    return body, content_type
 
 
 class BBDownService:
@@ -211,21 +306,6 @@ class BBDownService:
 SERVICE = BBDownService()
 
 
-def select_folder() -> str:
-    command = (
-        "Add-Type -AssemblyName System.Windows.Forms; "
-        "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
-        "$dialog.Description = '选择默认下载目录'; "
-        "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $dialog.SelectedPath }"
-    )
-    result = run_hidden(
-        ["powershell.exe", "-NoProfile", "-STA", "-Command", command],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-    )
-    stdout, _ = result.communicate(timeout=120)
-    return stdout.strip()
-
-
 def video_metadata(value: str) -> dict:
     bvid = re.search(r"(?i)(BV[0-9A-Z]{10})", value)
     av = re.search(r"(?i)(?:^|[^a-z])av(\d+)", value)
@@ -291,7 +371,8 @@ class Handler(SimpleHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
     def do_GET(self) -> None:
-        path = urllib.parse.urlparse(self.path).path
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
         try:
             if path == "/api/health":
                 config = read_config()
@@ -302,6 +383,15 @@ class Handler(SimpleHTTPRequestHandler):
                     "download_dir": config.get("download_dir", ""),
                     "dependency_problem": SERVICE.dependency_problem(),
                 })
+            elif path == "/api/cover":
+                cover_url = urllib.parse.parse_qs(parsed_url.query).get("url", [""])[0]
+                body, content_type = get_cover(cover_url)
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/api/config":
                 self.send_json(read_config())
             elif path == "/api/tasks":
@@ -333,7 +423,6 @@ class Handler(SimpleHTTPRequestHandler):
                 config = read_config()
                 config["download_dir"] = selected
                 save_config(config)
-                SERVICE.download_dir = selected
                 ok, message = SERVICE.ensure_started(selected)
                 self.send_json({"download_dir": selected, "ready": ok, "error": message})
             elif path == "/api/config":
@@ -344,7 +433,6 @@ class Handler(SimpleHTTPRequestHandler):
                 config = read_config()
                 config["download_dir"] = selected
                 save_config(config)
-                SERVICE.download_dir = selected
                 ok, message = SERVICE.ensure_started(selected)
                 self.send_json({"download_dir": selected, "ready": ok, "error": message})
             elif path == "/api/parse":
