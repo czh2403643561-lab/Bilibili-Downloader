@@ -1,6 +1,7 @@
-const state = { video: null, online: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, detail: null } };
+const state = { video: null, online: false, stale: false, restarting: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, postsError: '', collectionsError: '', detail: null } };
 const $ = (selector) => document.querySelector(selector);
 const PLACEHOLDER_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="328" height="184" viewBox="0 0 328 184"><rect width="328" height="184" fill="#eef0f4"/><path d="M132 78h64v28h-64z" fill="#c5ccd7"/><circle cx="148" cy="88" r="5" fill="#eef0f4"/><path d="m139 101 15-14 10 9 11-12 14 17z" fill="#eef0f4"/><text x="164" y="132" text-anchor="middle" fill="#8d98a8" font-size="14">封面暂时无法加载</text></svg>')}`;
+let loginTimer = null;
 
 async function api(path, options = {}) {
   let response;
@@ -11,7 +12,7 @@ async function api(path, options = {}) {
   catch (_) { if (!state.directorySelecting) setOffline(); throw new Error('本地服务已断开，请重新启动工具。'); }
   finally { if (timeout) clearTimeout(timeout); }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || '请求失败，请稍后重试。');
+  if (!response.ok) { const error = new Error(data.error || '请求失败，请稍后重试。'); error.status = response.status; error.data = data; throw error; }
   return data;
 }
 
@@ -23,6 +24,18 @@ function titleForStatus(task) { if (task.status === 'Finished') { if (task.isCan
 function setServiceState(health) {
   const badge = $('#service-state');
   const problem = health.dependency_problem;
+  const runningBuild = health.running_build_id || health.build_id || '';
+  const diskBuild = health.disk_build_id || runningBuild;
+  if (!health.running_build_id || health.stale || (runningBuild && diskBuild && runningBuild !== diskBuild)) {
+    state.online = false; state.stale = true;
+    badge.textContent = '正在更新本地服务…'; badge.className = 'status-pill problem';
+    $('#task-list').innerHTML = '<div class="task-empty">后台正在更新，请稍候…</div>';
+    state.up.profile = null; state.up.items = []; state.up.collections = []; state.up.detail = null;
+    $('#up-message').textContent = '后台版本已更新，正在重新连接…'; renderUp();
+    if (!state.restarting) restartLocalService();
+    return;
+  }
+  state.stale = false;
   state.online = true;
   badge.textContent = problem || (health.download_dir ? '本地服务已连接' : '等待设置目录');
   badge.className = `status-pill ${problem ? 'problem' : health.download_dir ? 'ready' : ''}`;
@@ -39,6 +52,22 @@ function setOffline() {
 }
 
 async function refreshHealth() { try { setServiceState(await api('/api/health')); } catch (_) { setOffline(); } }
+
+async function restartLocalService() {
+  if (state.restarting) return;
+  state.restarting = true;
+  try { await api('/api/restart', { method: 'POST', body: '{}', timeoutMs: 3000 }); } catch (_) { /* 旧进程可能在响应前退出 */ }
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    try {
+      const health = await api('/api/health', { timeoutMs: 1500 });
+      const runningBuild = health.running_build_id || health.build_id || '';
+      const diskBuild = health.disk_build_id || runningBuild;
+      if (health.online && !health.stale && runningBuild && runningBuild === diskBuild) { window.location.reload(); return; }
+    } catch (_) { /* 等待新实例 */ }
+  }
+  state.restarting = false; setOffline();
+}
 
 function renderVideo(video) {
   state.video = video;
@@ -90,9 +119,9 @@ function renderUp() {
   $('#up-result').classList.remove('hidden');
   const avatar = $('#up-avatar'); avatar.onerror = () => { avatar.onerror = null; avatar.src = PLACEHOLDER_COVER; }; avatar.src = up.profile.face ? `/api/cover?url=${encodeURIComponent(up.profile.face)}` : PLACEHOLDER_COVER;
   $('#up-name').textContent = up.profile.name; $('#up-total').textContent = `投稿 ${up.profile.total} 个 · 当前筛选 ${up.total} 个`;
-  $('#up-post-count').textContent = up.total; $('#up-collection-count').textContent = up.collectionTotal || '—'; $('#up-selected-count').textContent = `已选择 ${Object.keys(up.selected).length} 个`;
+  $('#up-post-count').textContent = up.total; $('#up-collection-count').textContent = up.collectionsError ? '加载失败' : (up.collectionTotal || '—'); $('#up-selected-count').textContent = `已选择 ${Object.keys(up.selected).length} 个`;
   $('#up-tab-posts').classList.toggle('active', up.tab === 'posts'); $('#up-tab-collections').classList.toggle('active', up.tab === 'collections');
-  $('#up-page-summary').textContent = `共 ${up.total} 个投稿 · 第 ${up.totalPages ? up.page : 0} / ${up.totalPages || 0} 页`;
+  $('#up-page-summary').textContent = up.postsError || `共 ${up.total} 个投稿 · 第 ${up.totalPages ? up.page : 0} / ${up.totalPages || 0} 页`;
   renderUpItemList('up-list', 'up-empty', up.items); renderPagination('up-pagination', up.page, up.totalPages, async (page) => { up.page = page; await loadUpPage(); });
   $('#up-download-button').disabled = !Object.keys(up.selected).length || up.loading;
   $('#up-posts-panel').classList.toggle('hidden', up.tab !== 'posts'); $('#up-collections-panel').classList.toggle('hidden', up.tab !== 'collections' || Boolean(up.detail)); $('#up-detail-panel').classList.toggle('hidden', up.tab !== 'detail');
@@ -106,23 +135,23 @@ function renderCollections() {
   container.querySelectorAll('.collection-cover').forEach((image) => { image.onerror = () => { image.onerror = null; image.src = PLACEHOLDER_COVER; }; });
   container.querySelectorAll('.collection-item').forEach((button) => button.addEventListener('click', () => loadCollectionDetail(1, button.dataset.collectionKind, button.dataset.collectionId)));
   $('#up-collection-empty').classList.toggle('hidden', up.collections.length > 0);
-  $('#up-collection-summary').textContent = `共 ${up.collectionTotal} 个合集和系列 · 第 ${up.collectionTotalPages ? up.collectionPage : 0} / ${up.collectionTotalPages || 0} 页`;
+  $('#up-collection-summary').textContent = up.collectionsError || `共 ${up.collectionTotal} 个合集和系列 · 第 ${up.collectionTotalPages ? up.collectionPage : 0} / ${up.collectionTotalPages || 0} 页`;
   renderPagination('up-collection-pagination', up.collectionPage, up.collectionTotalPages, async (page) => { up.collectionPage = page; await loadCollections(); });
 }
 
 async function loadUpPage(reset = false) {
-  const up = state.up; if (up.loading) return; if (reset) { up.page = 1; up.items = []; up.profile = null; up.total = 0; up.totalPages = 0; up.detail = null; }
+  const up = state.up; if (up.loading) return; if (reset) { up.page = 1; up.items = []; up.profile = null; up.total = 0; up.totalPages = 0; up.postsError = ''; up.detail = null; }
   up.loading = true; $('#up-message').textContent = '正在获取投稿…'; renderUp();
-  try { const result = await api('/api/up', { method: 'POST', timeoutMs: 60000, body: JSON.stringify({ input: up.input, page: up.page, period: up.period, keyword: up.keyword, page_size: 30 }) }); up.profile = result.profile; up.items = result.items || []; up.total = Number(result.total || 0); up.totalPages = Number(result.total_pages || 0); up.page = Number(result.page || up.page); $('#up-message').textContent = up.items.length ? '' : '没有符合条件的公开视频投稿。'; }
-  catch (error) { $('#up-message').textContent = error.message; up.items = []; up.total = 0; up.totalPages = 0; }
+  try { const result = await api('/api/up', { method: 'POST', timeoutMs: 60000, body: JSON.stringify({ input: up.input, page: up.page, period: up.period, keyword: up.keyword, page_size: 30 }) }); up.postsError = ''; up.profile = result.profile; up.items = result.items || []; up.total = Number(result.total || 0); up.totalPages = Number(result.total_pages || 0); up.page = Number(result.page || up.page); $('#up-message').textContent = up.items.length ? '' : '没有符合条件的公开视频投稿。'; }
+  catch (error) { up.postsError = error.message; $('#up-message').textContent = error.message; up.items = []; up.total = 0; up.totalPages = 0; }
   finally { up.loading = false; renderUp(); if (up.items.length) $('#up-list').scrollIntoView({ block: 'start' }); }
 }
 
 async function loadCollections(reset = false) {
-  const up = state.up; if (up.collectionLoading) return; if (reset) { up.collectionPage = 1; up.collections = []; up.collectionTotal = 0; up.collectionTotalPages = 0; }
+  const up = state.up; if (up.collectionLoading) return; if (reset) { up.collectionPage = 1; up.collections = []; up.collectionTotal = 0; up.collectionTotalPages = 0; up.collectionsError = ''; }
   up.collectionLoading = true; $('#up-message').textContent = '正在获取合集和系列…'; renderUp();
   try { const result = await api('/api/up/collections', { method: 'POST', timeoutMs: 30000, body: JSON.stringify({ input: up.input, page: up.collectionPage, page_size: 30 }) }); up.profile = { ...up.profile, ...result.profile, total: up.total || result.profile.total }; up.collections = result.items || []; up.collectionTotal = Number(result.total || 0); up.collectionTotalPages = Number(result.total_pages || 0); up.collectionPage = Number(result.page || up.collectionPage); $('#up-message').textContent = ''; }
-  catch (error) { $('#up-message').textContent = error.message; up.collections = []; up.collectionTotal = 0; up.collectionTotalPages = 0; }
+  catch (error) { up.collectionsError = error.message; $('#up-message').textContent = error.message; up.collections = []; up.collectionTotal = 0; up.collectionTotalPages = 0; }
   finally { up.collectionLoading = false; renderUp(); }
 }
 
@@ -197,6 +226,27 @@ async function chooseDirectory() {
 }
 async function simpleAction(path) { try { await api(path, { method: 'POST', body: '{}' }); } catch (error) { alert(error.message); } }
 
+function renderLoginStatus(result) {
+  $('#login-status').textContent = result.name ? `${result.status}：${result.name}` : (result.status || '未登录');
+  $('#login-start').classList.toggle('hidden', Boolean(result.logged_in));
+  $('#login-logout').classList.toggle('hidden', !result.logged_in);
+  $('#login-qr-panel').classList.toggle('hidden', Boolean(result.logged_in) || !$('#login-qr').src);
+}
+async function refreshLoginStatus() { try { renderLoginStatus(await api('/api/login/status')); } catch (error) { $('#login-status').textContent = error.message; } }
+async function startLogin() {
+  const button = $('#login-start'); button.disabled = true;
+  try {
+    const result = await api('/api/login/start', { method: 'POST', body: '{}' });
+    $('#login-qr').src = result.qr_image;
+    $('#login-qr-link').href = result.qr_url;
+    $('#login-qr-panel').classList.remove('hidden'); renderLoginStatus(result);
+    if (loginTimer) clearInterval(loginTimer);
+    loginTimer = setInterval(async () => { try { const status = await api('/api/login/poll', { method: 'POST', body: '{}' }); renderLoginStatus(status); if (status.logged_in || status.status === '二维码已过期') { clearInterval(loginTimer); loginTimer = null; } } catch (error) { $('#login-status').textContent = error.message; } }, 2000);
+  } catch (error) { $('#login-status').textContent = error.message; }
+  finally { button.disabled = false; }
+}
+async function logout() { try { renderLoginStatus(await api('/api/login/logout', { method: 'POST', body: '{}' })); } catch (error) { $('#login-status').textContent = error.message; } }
+
 function setupNavigation() { document.querySelectorAll('.nav-button').forEach((button) => button.addEventListener('click', () => { document.querySelectorAll('.nav-button').forEach((item) => item.classList.remove('active')); document.querySelectorAll('.page').forEach((item) => item.classList.add('hidden')); button.classList.add('active'); $(`#page-${button.dataset.page}`).classList.remove('hidden'); $('#page-title').textContent = ({ single: '单视频下载', up: 'UP 主批量下载', settings: '设置' }[button.dataset.page]); })); }
 function bindEvents() {
   $('#parse-button').addEventListener('click', parseVideo); $('#video-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseVideo(); });
@@ -204,6 +254,7 @@ function bindEvents() {
   $('#clear-all').addEventListener('click', () => document.querySelectorAll('#page-list input').forEach((input) => input.checked = false));
   $('#download-button').addEventListener('click', createTask); $('#choose-first-dir').addEventListener('click', chooseDirectory); $('#choose-dir').addEventListener('click', chooseDirectory);
   $('#open-download-dir').addEventListener('click', () => simpleAction('/api/open-download-directory')); $('#open-logs').addEventListener('click', () => simpleAction('/api/open-log-directory')); $('#export-logs').addEventListener('click', () => simpleAction('/api/export-logs'));
+  $('#login-start').addEventListener('click', startLogin); $('#login-logout').addEventListener('click', logout);
   $('#task-list').addEventListener('click', (event) => { const target = event.target; if (target.dataset.stop) stopTask(target.dataset.stop); if (target.dataset.retry) retryTask(target.dataset.retry); });
   $('#up-parse-button').addEventListener('click', parseUp); $('#up-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseUp(); });
   $('#up-filter-button').addEventListener('click', applyUpFilter); $('#up-select-page').addEventListener('click', selectUpPage); $('#up-clear-page').addEventListener('click', clearUpPage); $('#up-clear-selected').addEventListener('click', clearUpSelected);
@@ -217,4 +268,4 @@ function bindEvents() {
   $('#up-detail-clear-page').addEventListener('click', () => { (state.up.detail?.items || []).forEach((item) => delete state.up.selected[item.bvid]); renderUp(); });
   $('#up-clear-selected-detail').addEventListener('click', clearUpSelected);
 }
-setupNavigation(); bindEvents(); refreshHealth(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000);
+setupNavigation(); bindEvents(); refreshHealth(); refreshLoginStatus(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000);

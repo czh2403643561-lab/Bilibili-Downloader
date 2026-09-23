@@ -43,7 +43,7 @@
         <div class="card parse-card">
           <label for="up-url">UP 主主页或 mid</label>
           <div class="input-row"><input id="up-url" placeholder="例如 https://space.bilibili.com/24715837 或 24715837" autocomplete="off"><button class="primary" id="up-parse-button">获取投稿</button></div>
-          <p class="hint">只读取公开投稿，不读取浏览器 Cookie；列表按分页加载。</p>
+          <p class="hint">只读取公开投稿，不读取浏览器 Cookie；匿名访问受限时请在“设置”中扫码登录。</p>
           <p class="form-message" id="up-message"></p>
         </div>
         <div id="up-result" class="hidden">
@@ -62,7 +62,7 @@
         </div>
       </section>
 
-      <section class="page hidden" id="page-settings"><div class="card settings-row"><div><h2>默认下载目录</h2><p id="download-dir" class="muted">尚未设置</p></div><button class="secondary" id="choose-dir">修改目录</button></div><div class="card settings-row"><div><h2>诊断日志</h2><p class="muted">日志已自动脱敏，不会记录 Cookie 或 Token。</p></div><div class="button-group"><button class="secondary" id="open-logs">打开日志目录</button><button class="secondary" id="export-logs">导出诊断日志</button></div></div></section>
+      <section class="page hidden" id="page-settings"><div class="card settings-row"><div><h2>默认下载目录</h2><p id="download-dir" class="muted">尚未设置</p></div><button class="secondary" id="choose-dir">修改目录</button></div><div class="card settings-row login-card"><div><h2>B 站账号</h2><p id="login-status" class="muted">检查登录状态…</p><div id="login-qr-panel" class="hidden"><p class="muted">请使用 B 站 App 扫描下方二维码并确认登录。</p><img id="login-qr" alt="B 站扫码登录二维码" class="login-qr-frame"><p><a id="login-qr-link" target="_blank" rel="noreferrer">打开官方扫码页</a></p></div></div><div class="button-group"><button class="secondary" id="login-start">扫码登录</button><button class="secondary hidden" id="login-logout">退出登录</button></div></div><div class="card settings-row"><div><h2>诊断日志</h2><p class="muted">日志已自动脱敏，不会记录 Cookie 或 Token。</p></div><div class="button-group"><button class="secondary" id="open-logs">打开日志目录</button><button class="secondary" id="export-logs">导出诊断日志</button></div></div></section>
 
       <section class="task-section"><div class="section-heading"><div><p class="eyebrow">下载队列</p><h2>下载任务</h2></div><button class="secondary" id="open-download-dir">打开下载目录</button></div><div id="task-list" class="task-list"><div class="task-empty">暂无下载任务</div></div></section>
     </main>

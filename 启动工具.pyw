@@ -27,7 +27,7 @@ LOG_DIR = APP_DATA / "logs"
 LAUNCHER_LOG = LOG_DIR / "launcher.log"
 APP_PORT = 23666
 APP_ID = "BilibiliDownloader"
-BUILD_FILES = ("app.py", "static/index.html", "static/app.js", "static/styles.css")
+BUILD_FILES = ("app.py", "启动工具.pyw", "static/index.html", "static/app.js", "static/styles.css")
 BBDOWN = ROOT / "tools" / "BBDownNext" / "BBDown.exe"
 FFMPEG = ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
 BBDOWN_URL = "https://github.com/KaiHuaDou/BBDownNext/releases/download/v2.2.0/BBDown-win-x64.exe"
@@ -134,6 +134,12 @@ def request_shutdown() -> bool:
         return False
 
 
+def build_matches(instance: dict) -> bool:
+    running = instance.get("running_build_id") or instance.get("build_id")
+    disk = instance.get("disk_build_id") or running
+    return running == BUILD_ID and disk == BUILD_ID and instance.get("stale") is not True
+
+
 def listener_pids() -> list[int]:
     try:
         result = subprocess.run(
@@ -166,7 +172,7 @@ def stop_existing_instance() -> None:
     existing = health()
     if not existing or existing.get("app") != APP_ID or existing.get("online") is not True:
         raise RuntimeError("本地端口 23666 已被其他程序占用，未执行自动停止。")
-    log(f"准备替换旧实例：build={existing.get('build_id') or '未知'}，当前 build={BUILD_ID}")
+    log(f"准备替换旧实例：build={existing.get('running_build_id') or existing.get('build_id') or '未知'}，当前 build={BUILD_ID}")
     if request_shutdown():
         log("已请求旧实例正常退出")
     else:
@@ -211,7 +217,7 @@ def port_is_open() -> bool:
 def start_app() -> None:
     existing = health()
     if existing is not None:
-        if existing.get("app") == APP_ID and existing.get("online") is True and existing.get("build_id") == BUILD_ID:
+        if existing.get("app") == APP_ID and existing.get("online") is True and build_matches(existing):
             log("发现已运行实例，直接打开现有页面")
             webbrowser.open(f"http://127.0.0.1:{APP_PORT}/")
             return
@@ -237,7 +243,7 @@ def start_app() -> None:
     for _ in range(120):
         time.sleep(0.25)
         current = health()
-        if current and current.get("app") == APP_ID and current.get("online") is True and current.get("instance_id") == instance_id and current.get("build_id") == BUILD_ID:
+        if current and current.get("app") == APP_ID and current.get("online") is True and current.get("instance_id") == instance_id and build_matches(current):
             log("app.py API 已就绪，打开浏览器")
             webbrowser.open(f"http://127.0.0.1:{APP_PORT}/")
             return

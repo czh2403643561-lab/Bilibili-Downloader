@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import ctypes
+from ctypes import wintypes
 import html
 import json
 import hashlib
@@ -21,6 +24,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
+from http.cookies import SimpleCookie
 from datetime import datetime
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -34,11 +38,13 @@ BBDOWN = TOOLS_DIR / "BBDownNext" / "BBDown.exe"
 DEFAULT_APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 APP_DATA = Path(os.environ.get("BILIBILI_DOWNLOADER_DATA_DIR", DEFAULT_APP_DATA))
 CONFIG_FILE = APP_DATA / "config.json"
+AUTH_FILE = APP_DATA / "bilibili-auth.dat"
+QR_PACKAGE_DIR = APP_DATA / "python-packages"
 LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ALLOWED_COVER_SUFFIX = ".hdslb.com"
-BUILD_FILES = ("app.py", "static/index.html", "static/app.js", "static/styles.css")
+BUILD_FILES = ("app.py", "启动工具.pyw", "static/index.html", "static/app.js", "static/styles.css")
 BILIBILI_SPACE_API = "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space"
 BILIBILI_ARC_SEARCH_API = "https://api.bilibili.com/x/space/wbi/arc/search"
 BILIBILI_SEASONS_API = "https://api.bilibili.com/x/polymer/web-space/seasons_series_list"
@@ -50,6 +56,8 @@ BILIBILI_SPACE_FEATURES = (
     "decorationCard,commentsNewVersion,onlyfansAssetsV2,ugcDelete,avatarAutoTheme,"
     "cardsEnhance,eva3CardOpus,eva3CardVideo,eva3CardComment,eva3CardUser"
 )
+WEB_LOCALE = json.dumps({"c_locale": {"language": "zh", "script": "Hans"}, "always_translate": False}, separators=(",", ":"))
+WEB_DEVICE = json.dumps({"platform": "web", "device": "pc", "spmid": "333.1387", "mobi_app": "web_cn"}, separators=(",", ":"))
 WBI_MIXIN_KEY_TABLE = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52]
 WBI_MIXIN_KEY = ""
 UP_FILTER_CACHE: dict[tuple[str, str, str], list[dict]] = {}
@@ -58,7 +66,7 @@ UP_FILTER_CACHE: dict[tuple[str, str, str], list[dict]] = {}
 def redact(value: object) -> str:
     """避免诊断日志意外记录 Cookie、token 或带敏感查询参数的链接。"""
     text = str(value)
-    text = re.sub(r"(?i)(cookie|token|sessdata|access_token|refresh_token)([=:])[^\s,&;]+", r"\1\2<已脱敏>", text)
+    text = re.sub(r"(?i)(cookie|token|sessdata|access_token|refresh_token|qrcode_key)([=:])[^\s,&;]+", r"\1\2<已脱敏>", text)
     return text
 
 
@@ -94,14 +102,26 @@ def current_build_id() -> str:
 
 
 BUILD_ID = current_build_id()
+RESTART_LOCK = threading.Lock()
+RESTART_SCHEDULED = False
+
+
+def disk_build_id() -> str:
+    try:
+        return current_build_id()
+    except OSError:
+        LOG.exception("计算磁盘 build_id 失败")
+        return ""
 
 
 def configure_data_dir(data_dir: str | None) -> None:
     """测试可指定隔离目录，正常启动仍只使用当前用户的 AppData。"""
-    global APP_DATA, CONFIG_FILE, LOG_DIR
+    global APP_DATA, CONFIG_FILE, AUTH_FILE, QR_PACKAGE_DIR, LOG_DIR
     if data_dir:
         APP_DATA = Path(data_dir).expanduser().resolve()
         CONFIG_FILE = APP_DATA / "config.json"
+        AUTH_FILE = APP_DATA / "bilibili-auth.dat"
+        QR_PACKAGE_DIR = APP_DATA / "python-packages"
         LOG_DIR = APP_DATA / "logs"
 
 
@@ -122,6 +142,47 @@ def save_config(config: dict) -> None:
     temporary = CONFIG_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(CONFIG_FILE)
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+
+def _dpapi(plain: bytes, protect: bool) -> bytes:
+    if os.name != "nt":
+        raise RuntimeError("B 站登录凭据只能在 Windows 本机保存。")
+    source = ctypes.create_string_buffer(plain)
+    input_blob = _DataBlob(len(plain), ctypes.cast(source, ctypes.POINTER(ctypes.c_byte)))
+    output_blob = _DataBlob()
+    crypt = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    crypt.argtypes = [ctypes.POINTER(_DataBlob), ctypes.c_wchar_p, ctypes.POINTER(_DataBlob), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DataBlob)]
+    crypt.restype = wintypes.BOOL
+    if not crypt(ctypes.byref(input_blob), "Bilibili Downloader login", None, None, None, 0, ctypes.byref(output_blob)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+
+
+def save_auth_cookie(cookie: str) -> None:
+    APP_DATA.mkdir(parents=True, exist_ok=True)
+    encrypted = _dpapi(cookie.encode("utf-8"), True)
+    temporary = AUTH_FILE.with_suffix(".tmp")
+    temporary.write_text(base64.b64encode(encrypted).decode("ascii"), encoding="ascii")
+    temporary.replace(AUTH_FILE)
+
+
+def load_auth_cookie() -> str:
+    try:
+        encoded = AUTH_FILE.read_text(encoding="ascii")
+        return _dpapi(base64.b64decode(encoded), False).decode("utf-8")
+    except (FileNotFoundError, OSError, ValueError, UnicodeError, ctypes.ArgumentError):
+        return ""
+
+
+def clear_auth_cookie() -> None:
+    AUTH_FILE.unlink(missing_ok=True)
 
 
 def run_hidden(command: list[str], **kwargs) -> subprocess.Popen:
@@ -229,9 +290,9 @@ class BBDownService:
 
     def dependency_problem(self) -> str:
         if not BBDOWN.exists():
-            return "缺少 BBDownNext：请先双击“安装依赖.ps1”。"
+            return "缺少 BBDownNext：请重新双击“启动工具.vbs”自动准备依赖。"
         if not self.ffmpeg_available():
-            return "缺少 FFmpeg：请先双击“安装依赖.ps1”。"
+            return "缺少 FFmpeg：请重新双击“启动工具.vbs”自动准备依赖。"
         return ""
 
     def _environment(self) -> dict[str, str]:
@@ -321,6 +382,35 @@ class BBDownService:
 SERVICE = BBDownService()
 
 
+def schedule_restart() -> bool:
+    """让本地启动器接管版本替换，避免当前进程继续服务旧代码。"""
+    global RESTART_SCHEDULED
+    with RESTART_LOCK:
+        if RESTART_SCHEDULED:
+            return False
+        RESTART_SCHEDULED = True
+
+    def restart() -> None:
+        try:
+            launcher = ROOT / "启动工具.pyw"
+            pythonw = Path(sys.executable).with_name("pythonw.exe")
+            executable = str(pythonw if pythonw.exists() else sys.executable)
+            LOG.warning("检测到磁盘代码更新，启动器将替换当前后台实例")
+            run_hidden(
+                [executable, str(launcher)],
+                cwd=ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except Exception:
+            LOG.exception("自动重启启动器失败")
+
+    threading.Thread(target=restart, daemon=True).start()
+    return True
+
+
 def video_metadata(value: str) -> dict:
     bvid = re.search(r"(?i)(BV[0-9A-Z]{10})", value)
     av = re.search(r"(?i)(?:^|[^a-z])av(\d+)", value)
@@ -377,6 +467,9 @@ def bilibili_json(url: str, *, referer: str = "https://www.bilibili.com/", extra
         "Referer": referer,
         "Origin": "https://space.bilibili.com",
     }
+    saved_cookie = load_auth_cookie()
+    if saved_cookie:
+        headers["Cookie"] = saved_cookie
     if extra_headers:
         headers.update(extra_headers)
     request = urllib.request.Request(
@@ -397,6 +490,127 @@ def bilibili_json(url: str, *, referer: str = "https://www.bilibili.com/", extra
         raise ValueError("无法连接 B 站获取投稿，请检查网络后重试。") from error
 
 
+LOGIN_STATE: dict[str, object] = {}
+LOGIN_LOCK = threading.Lock()
+BILIBILI_QR_GENERATE = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+BILIBILI_QR_POLL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+
+
+def login_request(url: str) -> tuple[int, dict, list[str]]:
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"})
+    try:
+        with LOCAL_OPENER.open(request, timeout=15) as response:
+            return response.status, json.loads(response.read().decode("utf-8")), response.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", "replace")
+        try:
+            return error.code, json.loads(body), error.headers.get_all("Set-Cookie") or []
+        except json.JSONDecodeError:
+            return error.code, {}, []
+    except urllib.error.URLError as error:
+        raise ValueError("无法连接 B 站登录服务，请检查网络后重试。") from error
+
+
+def login_status_text(code: int) -> str:
+    return {86101: "等待扫码", 86090: "已扫码，等待确认", 86038: "二维码已过期"}.get(code, "等待扫码")
+
+
+def start_login() -> dict:
+    status, payload, _ = login_request(BILIBILI_QR_GENERATE)
+    data = payload.get("data") or {}
+    if status != 200 or payload.get("code") != 0 or not data.get("url") or not data.get("qrcode_key"):
+        raise ValueError("申请 B 站登录二维码失败，请稍后重试。")
+    with LOGIN_LOCK:
+        LOGIN_STATE.clear()
+        LOGIN_STATE.update({"qrcode_key": str(data["qrcode_key"]), "status": "等待扫码", "expires_at": time.time() + 180, "qr_url": str(data["url"])})
+    return {"status": "等待扫码", "expires_at": LOGIN_STATE["expires_at"], "qr_url": str(data["url"]), "qr_image": "/api/login/qr.svg?url=" + urllib.parse.quote(str(data["url"]), safe=""), "qrcode_key": str(data["qrcode_key"])}
+
+
+def poll_login() -> dict:
+    with LOGIN_LOCK:
+        key = str(LOGIN_STATE.get("qrcode_key") or "")
+        expires_at = float(LOGIN_STATE.get("expires_at") or 0)
+    if not key:
+        return {"logged_in": bool(load_auth_cookie()), "status": "未登录"}
+    if time.time() >= expires_at:
+        with LOGIN_LOCK:
+            LOGIN_STATE["status"] = "二维码已过期"
+        return {"logged_in": False, "status": "二维码已过期"}
+    status, payload, set_cookies = login_request(BILIBILI_QR_POLL + "?" + urllib.parse.urlencode({"qrcode_key": key, "source": "main_web"}))
+    data = payload.get("data") or {}
+    result_code = int(data.get("code") or payload.get("code") or 0)
+    if result_code == 0 and data.get("url"):
+        cookie = SimpleCookie()
+        for header in set_cookies:
+            cookie.load(header)
+        pairs = [f"{name}={morsel.value}" for name, morsel in cookie.items()]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(str(data["url"])).query)
+        for name in ("SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5"):
+            if query.get(name) and not any(pair.startswith(name + "=") for pair in pairs):
+                pairs.append(f"{name}={query[name][0]}")
+        if not pairs:
+            raise ValueError("B 站登录成功但未取得登录凭据，请重试。")
+        save_auth_cookie("; ".join(pairs))
+        with LOGIN_LOCK:
+            LOGIN_STATE.clear()
+            LOGIN_STATE["status"] = "登录成功"
+        return {"logged_in": True, "status": "登录成功"}
+    text = login_status_text(result_code)
+    with LOGIN_LOCK:
+        LOGIN_STATE["status"] = text
+    return {"logged_in": False, "status": text}
+
+
+def account_status() -> dict:
+    if not load_auth_cookie():
+        return {"logged_in": False, "status": "未登录"}
+    try:
+        status, payload = bilibili_json("https://api.bilibili.com/x/web-interface/nav", referer="https://www.bilibili.com/")
+        data = payload.get("data") or {}
+        if status == 200 and payload.get("code") == 0 and data.get("isLogin"):
+            return {"logged_in": True, "status": "已登录", "name": data.get("uname") or "B 站账号", "mid": data.get("mid")}
+    except ValueError:
+        pass
+    return {"logged_in": False, "status": "登录已失效，请重新扫码"}
+
+
+def qr_module():
+    if str(QR_PACKAGE_DIR) not in sys.path:
+        sys.path.insert(0, str(QR_PACKAGE_DIR))
+    try:
+        import qrcode
+        return qrcode
+    except ImportError:
+        QR_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
+        python = Path(sys.executable)
+        pip_env = os.environ.copy()
+        for proxy_name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            pip_env.pop(proxy_name, None)
+        result = subprocess.run([
+            str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location",
+            "--target", str(QR_PACKAGE_DIR), "qrcode",
+        ], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=pip_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", timeout=45, check=False)
+        if result.returncode != 0:
+            LOG.warning("二维码组件准备失败：%s", result.stdout[-500:])
+            raise ValueError("二维码组件准备失败，请检查网络后重试。")
+        try:
+            import qrcode
+            return qrcode
+        except ImportError as error:
+            raise ValueError("二维码组件准备失败，请重新启动工具后重试。") from error
+
+
+def qr_svg(value: str) -> bytes:
+    qrcode = qr_module()
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=4)
+    qr.add_data(value)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    size = len(matrix)
+    path = "".join(f"M{x} {y}h1v1h-1z" for y, row in enumerate(matrix) for x, dark in enumerate(row) if dark)
+    return f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="white"/><path d="{path}" fill="black"/></svg>'.encode("utf-8")
+
+
 ANONYMOUS_COOKIE = ""
 
 
@@ -411,6 +625,10 @@ def anonymous_cookie() -> str:
         raise ValueError("B 站匿名访问参数暂时不可用，请稍后重试。")
     ANONYMOUS_COOKIE = "; ".join(pairs)
     return ANONYMOUS_COOKIE
+
+
+def request_cookie() -> str:
+    return load_auth_cookie() or anonymous_cookie()
 
 
 def wbi_signed_query(params: dict) -> str:
@@ -440,7 +658,7 @@ def up_profile(mid: str) -> dict:
     )
     code = payload.get("code")
     if status == 412 or code in {-352, -412}:
-        raise ValueError("B 站暂时要求安全验证，无法获取该 UP 主投稿。")
+        raise ValueError("B 站暂时要求安全验证，无法获取该 UP 主投稿；请在“设置”中扫码登录后重试。")
     if code == -799:
         raise ValueError("B 站请求过于频繁，请稍后重试。")
     data = payload.get("data") or {}
@@ -477,7 +695,7 @@ def space_feed(query: dict, mid: str) -> tuple[int, dict]:
     status, payload = bilibili_json(
         signed_url,
         referer=f"https://space.bilibili.com/{mid}",
-        extra_headers={"Cookie": anonymous_cookie()},
+        extra_headers={"Cookie": request_cookie()},
     )
     data = payload.get("data") or {}
     # 该公开接口偶尔会对带签名请求返回 code=0 但空列表；再尝试一次兼容的无签名请求。
@@ -485,7 +703,7 @@ def space_feed(query: dict, mid: str) -> tuple[int, dict]:
         fallback_status, fallback_payload = bilibili_json(
             BILIBILI_SPACE_API + "?" + urllib.parse.urlencode(query),
             referer=f"https://space.bilibili.com/{mid}",
-            extra_headers={"Cookie": anonymous_cookie()},
+            extra_headers={"Cookie": request_cookie()},
         )
         fallback_data = fallback_payload.get("data") or {}
         if fallback_payload.get("code") == 0 and fallback_data.get("items"):
@@ -547,7 +765,7 @@ def bili_error(status: int, payload: dict, action: str) -> None:
     code = payload.get("code")
     if status == 412 or code in {-352, -412}:
         LOG.warning("B 站%s触发安全验证 status=%s code=%s message=%s", action, status, code, payload.get("message"))
-        raise ValueError(f"B 站暂时要求安全验证，无法{action}，请稍后重试。")
+        raise ValueError(f"B 站暂时要求安全验证，无法{action}；请在“设置”中扫码登录后重试。")
     if code == -799:
         raise ValueError("B 站请求过于频繁，请稍后重试。")
     if code != 0:
@@ -557,12 +775,13 @@ def bili_error(status: int, payload: dict, action: str) -> None:
 
 def fetch_arc_page(mid: str, page: int, keyword: str, page_size: int, owner_name: str) -> dict:
     query = {
-        "mid": mid, "pn": page, "ps": page_size, "order": "pubdate", "keyword": keyword,
-        "platform": "web", "web_location": "1550101", "order_avoided": "true",
+        "mid": mid, "pn": page, "ps": page_size, "index": 0, "order": "pubdate", "keyword": keyword,
+        "platform": "web", "web_location": "333.1387", "order_avoided": "true",
+        "x-bili-locale-json": WEB_LOCALE, "x-bili-device-req-json": WEB_DEVICE,
         "dm_img_list": "[]",
         "dm_img_str": "V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ",
-        "dm_cover_img_str": "QU5HTEUgKE5WSURJQSwgTlZJRElBIEdlRm9yY2UgUlRYIDIwNjAgKDB4MDAwMDFGMDgpIERpcmVjdDNEMTEgdnNfNV8wIHBzXzVfMCwgRDNEMTEpR29vZ2xlIEluYy4gKE5WSURJQ",
-        "dm_img_inter": json.dumps({"ds": [], "wh": [5715, 6540, 43], "of": [335, 670, 335]}, separators=(",", ":")),
+        "dm_cover_img_str": "QU5HTEUgKE1pY3Jvc29mdCwgTWljcm9zb2Z0IEJhc2ljIFJlbmRlciBEcml2ZXIgKDB4MDAwMDAwOEMpIERpcmVjdDNEMTEgdnNfNV8wIHBzXzVfMCwgRDNEMTEpR29vZ2xlIEluYy4gKE5WSURJIEdlRm9yY2U",
+        "dm_img_inter": json.dumps({"ds": [], "wh": [4922, 5679, 104], "of": [195, 390, 195]}, separators=(",", ":")),
     }
     status, payload = 0, {}
     for attempt in range(3):
@@ -570,7 +789,7 @@ def fetch_arc_page(mid: str, page: int, keyword: str, page_size: int, owner_name
         status, payload = bilibili_json(
             signed_url,
             referer=f"https://space.bilibili.com/{mid}/video",
-            extra_headers={"Cookie": anonymous_cookie(), "Accept": "application/json, text/plain, */*"},
+            extra_headers={"Cookie": request_cookie(), "Accept": "application/json, text/plain, */*"},
         )
         if status != 412 and payload.get("code") not in {-352, -412, -799}:
             break
@@ -583,6 +802,8 @@ def fetch_arc_page(mid: str, page: int, keyword: str, page_size: int, owner_name
     count = int(page_info.get("count") or 0)
     actual_page = int(page_info.get("pn") or page)
     actual_size = int(page_info.get("ps") or page_size)
+    if page > 1 and actual_page != page:
+        raise ValueError("B 站返回的投稿分页暂时不可用，请在“设置”中扫码登录后重试。")
     return {"items": items, "total": count, "page": actual_page, "page_size": actual_size, "total_pages": (count + actual_size - 1) // actual_size if count else 0}
 
 
@@ -638,7 +859,7 @@ def fetch_collections(value: str, page: int = 1, page_size: int = 30) -> dict:
     profile = up_profile(mid)
     page = max(1, int(page or 1))
     page_size = max(1, min(int(page_size or 30), 20))
-    query = {"mid": mid, "page_num": page, "page_size": page_size, "web_location": "333.999"}
+    query = {"mid": mid, "page_num": page, "page_size": page_size, "web_location": "333.1387", "x-bili-locale-json": WEB_LOCALE, "x-bili-device-req-json": WEB_DEVICE}
     status, payload = bilibili_json(BILIBILI_SEASONS_API + "?" + urllib.parse.urlencode(query), referer=f"https://space.bilibili.com/{mid}/video")
     bili_error(status, payload, "获取合集和系列")
     data = payload.get("data") or {}
@@ -665,7 +886,7 @@ def fetch_collection_detail(value: str, kind: str, collection_id: str, page: int
     page = max(1, int(page or 1))
     page_size = max(1, min(int(page_size or 30), 30))
     if kind == "season":
-        query = {"mid": mid, "season_id": collection_id, "sort_reverse": "false", "page_num": page, "page_size": page_size, "web_location": "333.999"}
+        query = {"mid": mid, "season_id": collection_id, "sort_reverse": "false", "page_num": page, "page_size": page_size, "web_location": "333.1387", "x-bili-locale-json": WEB_LOCALE, "x-bili-device-req-json": WEB_DEVICE}
         endpoint = BILIBILI_SEASON_ARCHIVES_API
     elif kind == "series":
         query = {"mid": mid, "series_id": collection_id, "only_normal": "true", "sort": "desc", "pn": page, "ps": page_size}
@@ -715,10 +936,14 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             if path == "/api/health":
                 config = read_config()
+                current_disk_build = disk_build_id()
                 self.send_json({
                     "app": APP_NAME,
                     "online": True,
                     "build_id": BUILD_ID,
+                    "running_build_id": BUILD_ID,
+                    "disk_build_id": current_disk_build,
+                    "stale": bool(current_disk_build and current_disk_build != BUILD_ID),
                     "instance_id": getattr(self.server, "instance_id", ""),
                     "download_dir": config.get("download_dir", ""),
                     "dependency_problem": SERVICE.dependency_problem(),
@@ -732,8 +957,30 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/api/login/qr.svg":
+                value = urllib.parse.parse_qs(parsed_url.query).get("url", [""])[0]
+                with LOGIN_LOCK:
+                    expected = str(LOGIN_STATE.get("qr_url") or "")
+                if not value or value != expected:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                body = qr_svg(value)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/api/config":
                 self.send_json(read_config())
+            elif path == "/api/login/status":
+                with LOGIN_LOCK:
+                    pending = bool(LOGIN_STATE.get("qrcode_key"))
+                    pending_status = str(LOGIN_STATE.get("status") or "")
+                result = account_status()
+                if not result["logged_in"] and pending:
+                    result["status"] = pending_status
+                self.send_json(result)
             elif path == "/api/tasks":
                 if not SERVICE.download_dir:
                     SERVICE.download_dir = read_config().get("download_dir", "")
@@ -775,9 +1022,18 @@ class Handler(SimpleHTTPRequestHandler):
                 save_config(config)
                 ok, message = SERVICE.ensure_started(selected)
                 self.send_json({"download_dir": selected, "ready": ok, "error": message})
+            elif path == "/api/login/start":
+                self.send_json(start_login())
+            elif path == "/api/login/poll":
+                self.send_json(poll_login())
+            elif path == "/api/login/logout":
+                clear_auth_cookie()
+                with LOGIN_LOCK:
+                    LOGIN_STATE.clear()
+                self.send_json({"logged_in": False, "status": "未登录"})
             elif path == "/api/parse":
                 if not BBDOWN.exists():
-                    raise ValueError("缺少 BBDownNext：请先双击“安装依赖.ps1”。")
+                    raise ValueError("缺少 BBDownNext：请重新双击“启动工具.vbs”自动准备依赖。")
                 self.send_json(video_metadata(str(data.get("url", "")).strip()))
             elif path == "/api/up":
                 self.send_json(fetch_up_page(
@@ -804,6 +1060,13 @@ class Handler(SimpleHTTPRequestHandler):
             elif path == "/api/shutdown":
                 self.send_json({"ok": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
+            elif path == "/api/restart":
+                disk_id = disk_build_id()
+                if not disk_id or disk_id == BUILD_ID:
+                    self.send_json({"ok": True, "restarting": False, "build_id": BUILD_ID})
+                    return
+                scheduled = schedule_restart()
+                self.send_json({"ok": True, "restarting": True, "scheduled": scheduled, "disk_build_id": disk_id})
             elif path == "/api/tasks":
                 pages = [str(page) for page in data.get("pages", []) if str(page).isdigit()]
                 all_pages = bool(data.get("all_pages"))
