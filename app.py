@@ -37,6 +37,7 @@ LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ALLOWED_COVER_SUFFIX = ".hdslb.com"
+BUILD_FILES = ("app.py", "static/index.html", "static/app.js", "static/styles.css")
 BILIBILI_SPACE_API = "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space"
 BILIBILI_PROFILE_API = "https://api.bilibili.com/x/web-interface/card"
 BILIBILI_SPACE_FEATURES = (
@@ -74,6 +75,18 @@ def setup_logging() -> logging.Logger:
 
 
 LOG = logging.getLogger(APP_NAME)
+
+
+def current_build_id() -> str:
+    digest = hashlib.sha256()
+    for relative in BUILD_FILES:
+        path = ROOT / relative
+        digest.update(relative.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+BUILD_ID = current_build_id()
 
 
 def configure_data_dir(data_dir: str | None) -> None:
@@ -602,6 +615,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json({
                     "app": APP_NAME,
                     "online": True,
+                    "build_id": BUILD_ID,
                     "instance_id": getattr(self.server, "instance_id", ""),
                     "download_dir": config.get("download_dir", ""),
                     "dependency_problem": SERVICE.dependency_problem(),
@@ -670,6 +684,9 @@ class Handler(SimpleHTTPRequestHandler):
                     str(data.get("keyword", "")).strip(),
                     int(data.get("page_size", 30) or 30),
                 ))
+            elif path == "/api/shutdown":
+                self.send_json({"ok": True})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
             elif path == "/api/tasks":
                 pages = [str(page) for page in data.get("pages", []) if str(page).isdigit()]
                 all_pages = bool(data.get("all_pages"))
@@ -738,6 +755,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(raw)
 

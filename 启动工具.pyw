@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -25,11 +26,25 @@ APP_DATA = Path(os.environ.get("BILIBILI_DOWNLOADER_DATA_DIR", Path(os.environ.g
 LOG_DIR = APP_DATA / "logs"
 LAUNCHER_LOG = LOG_DIR / "launcher.log"
 APP_PORT = 23666
+APP_ID = "BilibiliDownloader"
+BUILD_FILES = ("app.py", "static/index.html", "static/app.js", "static/styles.css")
 BBDOWN = ROOT / "tools" / "BBDownNext" / "BBDown.exe"
 FFMPEG = ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
 BBDOWN_URL = "https://github.com/KaiHuaDou/BBDownNext/releases/download/v2.2.0/BBDown-win-x64.exe"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def current_build_id() -> str:
+    digest = hashlib.sha256()
+    for relative in BUILD_FILES:
+        path = ROOT / relative
+        digest.update(relative.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+BUILD_ID = current_build_id()
 
 
 def log(message: str, exc_info: bool = False) -> None:
@@ -105,6 +120,86 @@ def health() -> dict | None:
         return None
 
 
+def request_shutdown() -> bool:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{APP_PORT}/api/shutdown",
+        data=b"{}",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with LOCAL_OPENER.open(request, timeout=2) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def listener_pids() -> list[int]:
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            creationflags=hidden_flags(),
+            capture_output=True,
+            text=True,
+            encoding="mbcs",
+            errors="replace",
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids = set()
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[0].upper() != "TCP":
+            continue
+        local_address = fields[1].rsplit(":", 1)
+        if len(local_address) == 2 and local_address[1] == str(APP_PORT) and fields[3].upper() == "LISTENING":
+            try:
+                pids.add(int(fields[4]))
+            except ValueError:
+                pass
+    return sorted(pids)
+
+
+def stop_existing_instance() -> None:
+    existing = health()
+    if not existing or existing.get("app") != APP_ID or existing.get("online") is not True:
+        raise RuntimeError("本地端口 23666 已被其他程序占用，未执行自动停止。")
+    log(f"准备替换旧实例：build={existing.get('build_id') or '未知'}，当前 build={BUILD_ID}")
+    if request_shutdown():
+        log("已请求旧实例正常退出")
+    else:
+        log("旧实例不支持本地 shutdown，准备按已确认的 23666 监听 PID 结束")
+    for _ in range(20):
+        if health() is None and not port_is_open():
+            return
+        time.sleep(0.25)
+
+    pids = [pid for pid in listener_pids() if pid not in {0, os.getpid()}]
+    if not pids:
+        raise RuntimeError("旧实例未能退出，且无法确认 23666 的监听进程。")
+    for pid in pids:
+        log(f"结束已确认属于本项目的 23666 监听进程 PID={pid}")
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            creationflags=hidden_flags(),
+            capture_output=True,
+            text=True,
+            encoding="mbcs",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+        if result.returncode != 0:
+            log(f"结束旧实例失败 PID={pid}：{result.stdout[-500:]} {result.stderr[-500:]}")
+    for _ in range(20):
+        if health() is None and not port_is_open():
+            return
+        time.sleep(0.25)
+    raise RuntimeError("旧实例未能退出，无法安全启动最新版本。")
+
+
 def port_is_open() -> bool:
     try:
         with socket.create_connection(("127.0.0.1", APP_PORT), timeout=0.5):
@@ -116,11 +211,14 @@ def port_is_open() -> bool:
 def start_app() -> None:
     existing = health()
     if existing is not None:
-        if existing.get("app") == "BilibiliDownloader" and existing.get("online") is True:
+        if existing.get("app") == APP_ID and existing.get("online") is True and existing.get("build_id") == BUILD_ID:
             log("发现已运行实例，直接打开现有页面")
             webbrowser.open(f"http://127.0.0.1:{APP_PORT}/")
             return
-        raise RuntimeError("本地端口 23666 已被其他程序占用，无法启动 Bilibili Downloader。")
+        if existing.get("app") == APP_ID and existing.get("online") is True:
+            stop_existing_instance()
+        else:
+            raise RuntimeError("本地端口 23666 已被其他程序占用，无法启动 Bilibili Downloader。")
     if port_is_open():
         raise RuntimeError("本地端口 23666 已被其他程序占用或旧实例异常，请关闭占用该端口的程序后重试。")
 
@@ -139,7 +237,7 @@ def start_app() -> None:
     for _ in range(120):
         time.sleep(0.25)
         current = health()
-        if current and current.get("app") == "BilibiliDownloader" and current.get("instance_id") == instance_id:
+        if current and current.get("app") == APP_ID and current.get("online") is True and current.get("instance_id") == instance_id and current.get("build_id") == BUILD_ID:
             log("app.py API 已就绪，打开浏览器")
             webbrowser.open(f"http://127.0.0.1:{APP_PORT}/")
             return
