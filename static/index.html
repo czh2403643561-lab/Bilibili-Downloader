@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bilibili Downloader</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark"></span><span>Bilibili Downloader</span></div>
+      <nav>
+        <button class="nav-button active" data-page="single">单视频</button>
+        <button class="nav-button" data-page="up">UP 主批量</button>
+        <button class="nav-button" data-page="settings">设置</button>
+      </nav>
+      <p class="sidebar-note">本地运行 · 下载文件只保存在你的电脑</p>
+    </aside>
+    <main>
+      <header><div><p class="eyebrow">本地下载工具</p><h1 id="page-title">单视频下载</h1></div><span id="service-state" class="status-pill">检查中</span></header>
+
+      <section id="first-run" class="notice hidden">
+        <div><strong>先选择下载目录</strong><p>首次使用需要选择一个用于保存视频和音频的文件夹。</p></div>
+        <button class="primary" id="choose-first-dir">选择下载目录</button>
+      </section>
+
+      <section class="page" id="page-single">
+        <div class="card parse-card">
+          <label for="video-url">B 站视频链接或 BV 号</label>
+          <div class="input-row"><input id="video-url" placeholder="例如 https://www.bilibili.com/video/BV..." autocomplete="off"><button class="primary" id="parse-button">解析视频</button></div>
+          <p class="hint">仅支持普通公开视频；清晰度最高使用 1080P（取决于视频可用权限）。</p>
+          <p class="form-message" id="parse-message"></p>
+        </div>
+
+        <div id="video-result" class="hidden">
+          <div class="card video-summary"><img id="video-cover" alt="视频封面"><div><p class="eyebrow">已解析</p><h2 id="video-title"></h2><p id="video-owner" class="muted"></p></div></div>
+          <div class="card"><div class="section-heading"><div><h2>选择分 P</h2><p>下载前可按需勾选分集。</p></div><div class="button-group"><button class="secondary" id="select-all">全选</button><button class="secondary" id="clear-all">取消全选</button></div></div><div id="page-list" class="page-list"></div></div>
+          <div class="card download-options"><div><h2>下载格式</h2><p>视频会由 BBDownNext 与 FFmpeg 合成为 MP4。</p></div><div class="segmented"><label><input type="radio" name="mode" value="video" checked><span>视频 MP4</span></label><label><input type="radio" name="mode" value="audio"><span>仅音频 M4A</span></label></div><button class="primary" id="download-button">开始下载</button></div>
+        </div>
+      </section>
+
+      <section class="page hidden" id="page-up"><div class="card empty-state"><h2>UP 主批量下载将在下一阶段提供</h2><p>本轮先完成单视频下载闭环。这里会保留为后续的视频列表、筛选和批量选择入口。</p></div></section>
+
+      <section class="page hidden" id="page-settings"><div class="card settings-row"><div><h2>默认下载目录</h2><p id="download-dir" class="muted">尚未设置</p></div><button class="secondary" id="choose-dir">修改目录</button></div><div class="card settings-row"><div><h2>诊断日志</h2><p class="muted">日志已自动脱敏，不会记录 Cookie 或 Token。</p></div><div class="button-group"><button class="secondary" id="open-logs">打开日志目录</button><button class="secondary" id="export-logs">导出诊断日志</button></div></div></section>
+
+      <section class="task-section"><div class="section-heading"><div><p class="eyebrow">下载队列</p><h2>下载任务</h2></div><button class="secondary" id="open-download-dir">打开下载目录</button></div><div id="task-list" class="task-list"><div class="task-empty">暂无下载任务</div></div></section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
