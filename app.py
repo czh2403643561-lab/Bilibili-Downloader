@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
-from ctypes import wintypes
 import json
 import hashlib
 import logging
@@ -39,20 +37,6 @@ LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ALLOWED_COVER_SUFFIX = ".hdslb.com"
-
-
-if os.name == "nt":
-    class BrowseInfo(ctypes.Structure):
-        _fields_ = [
-            ("hwndOwner", wintypes.HWND),
-            ("pidlRoot", ctypes.c_void_p),
-            ("pszDisplayName", wintypes.LPWSTR),
-            ("lpszTitle", wintypes.LPCWSTR),
-            ("ulFlags", wintypes.UINT),
-            ("lpfn", ctypes.c_void_p),
-            ("lParam", wintypes.LPARAM),
-            ("iImage", ctypes.c_int),
-        ]
 
 
 def redact(value: object) -> str:
@@ -118,35 +102,34 @@ def run_hidden(command: list[str], **kwargs) -> subprocess.Popen:
 
 
 def select_folder() -> str:
-    """使用 Windows 原生目录选择器，不启动 PowerShell，不阻塞主服务。"""
+    """使用 Python 标准库目录选择器，不启动 PowerShell。"""
     if os.name != "nt":
         raise RuntimeError("当前系统不支持 Windows 文件夹选择器。")
-    shell32 = ctypes.windll.shell32
-    user32 = ctypes.windll.user32
-    ole32 = ctypes.windll.ole32
-    display_name = ctypes.create_unicode_buffer(260)
-    flags = 0x0001 | 0x0010 | 0x0040  # RETURNONLYFSDIRS + EDITBOX + NEWDIALOGSTYLE
-    info = BrowseInfo(
-        hwndOwner=user32.GetForegroundWindow(),
-        pidlRoot=None,
-        pszDisplayName=ctypes.cast(display_name, wintypes.LPWSTR),
-        lpszTitle="选择默认下载目录",
-        ulFlags=flags,
-        lpfn=None,
-        lParam=0,
-        iImage=0,
-    )
-    shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
-    selected = shell32.SHBrowseForFolderW(ctypes.byref(info))
-    if not selected:
-        return ""
     try:
-        path = ctypes.create_unicode_buffer(32768)
-        if shell32.SHGetPathFromIDListW(selected, path):
-            return path.value
-        return ""
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError as error:
+        raise RuntimeError("当前 Python 未包含 Windows 文件夹选择组件，请重新安装 Python。") from error
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update_idletasks()
+        return filedialog.askdirectory(
+            parent=root,
+            title="选择默认下载目录",
+            mustexist=False,
+        )
+    except tk.TclError as error:
+        raise RuntimeError("无法打开 Windows 文件夹选择窗口，请重启工具后重试。") from error
     finally:
-        ole32.CoTaskMemFree(selected)
+        if root is not None:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
 
 
 def allowed_cover_url(value: str) -> bool:
@@ -247,6 +230,10 @@ class BBDownService:
         problem = self.dependency_problem()
         if problem:
             return False, problem
+        # 配置切换和前端轮询可能并发到达；以磁盘中的最新配置为准，避免旧轮询把服务切回旧目录。
+        configured_dir = read_config().get("download_dir", "")
+        if configured_dir:
+            download_dir = configured_dir
         with self.lock:
             if self.process and self.process.poll() is None and self.download_dir == download_dir:
                 return True, ""
@@ -482,7 +469,10 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"error": short_error(error)}, 400)
         except Exception as error:
             LOG.exception("处理 POST 失败：%s", error)
-            self.send_json({"error": "发生意外错误，请导出诊断日志查看详情。"}, 500)
+            if path in {"/api/select-directory", "/api/config"}:
+                self.send_json({"error": "目录设置失败，请检查目录权限后重试；仍失败时请导出诊断日志。"}, 500)
+            else:
+                self.send_json({"error": "发生意外错误，请导出诊断日志查看详情。"}, 500)
 
     def serve_static(self, path: str) -> None:
         relative = "index.html" if path in {"/", ""} else path.lstrip("/")
