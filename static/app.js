@@ -1,8 +1,13 @@
-const state = { video: null, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}') };
+const state = { video: null, online: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}') };
 const $ = (selector) => document.querySelector(selector);
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+  let response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try { response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, signal: controller.signal, ...options }); }
+  catch (_) { setOffline(); throw new Error('本地服务已断开，请重新启动工具。'); }
+  finally { clearTimeout(timeout); }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || '请求失败，请稍后重试。');
   return data;
@@ -16,13 +21,21 @@ function titleForStatus(task) { if (task.status === 'Finished') { if (task.isCan
 function setServiceState(health) {
   const badge = $('#service-state');
   const problem = health.dependency_problem;
-  badge.textContent = problem || (health.download_dir ? '下载服务就绪' : '等待设置目录');
+  state.online = true;
+  badge.textContent = problem || (health.download_dir ? '本地服务已连接' : '等待设置目录');
   badge.className = `status-pill ${problem ? 'problem' : health.download_dir ? 'ready' : ''}`;
   $('#first-run').classList.toggle('hidden', Boolean(health.download_dir));
   $('#download-dir').textContent = health.download_dir || '尚未设置';
 }
 
-async function refreshHealth() { try { setServiceState(await api('/api/health')); } catch (_) { $('#service-state').textContent = '本地服务未响应'; } }
+function setOffline() {
+  state.online = false;
+  const badge = $('#service-state');
+  badge.textContent = '本地服务已断开，请重新启动工具';
+  badge.className = 'status-pill problem';
+}
+
+async function refreshHealth() { try { setServiceState(await api('/api/health')); } catch (_) { setOffline(); } }
 
 function renderVideo(video) {
   state.video = video;
@@ -72,6 +85,7 @@ function taskHtml(task) {
   return `<article class="task"><div class="task-top"><span class="task-name">${escapeHtml(task.title || task.url)}</span><span class="task-status ${failed ? 'failed' : task.isSuccessful ? 'done' : ''}">${status}</span><span class="task-actions">${actions}</span></div><div class="task-progress"><span style="width:${task.isSuccessful ? 100 : progress}%"></span></div><div class="task-meta"><span>进度：${task.isSuccessful ? 100 : progress}%</span><span>${formatSpeed(task.downloadSpeed)}</span></div>${failed && task.errorMessage ? `<div class="task-error">${escapeHtml(task.errorMessage)}</div>` : ''}</article>`;
 }
 async function refreshTasks() {
+  if (!state.online) return;
   try {
     const snapshot = await api('/api/tasks'); const tasks = [...(snapshot.running || []), ...(snapshot.finished || [])];
     $('#task-list').innerHTML = tasks.length ? tasks.map(taskHtml).join('') : '<div class="task-empty">暂无下载任务</div>';
@@ -89,4 +103,4 @@ function bindEvents() {
   $('#open-download-dir').addEventListener('click', () => simpleAction('/api/open-download-directory')); $('#open-logs').addEventListener('click', () => simpleAction('/api/open-log-directory')); $('#export-logs').addEventListener('click', () => simpleAction('/api/export-logs'));
   $('#task-list').addEventListener('click', (event) => { const target = event.target; if (target.dataset.stop) stopTask(target.dataset.stop); if (target.dataset.retry) retryTask(target.dataset.retry); });
 }
-setupNavigation(); bindEvents(); refreshHealth(); refreshTasks(); setInterval(refreshTasks, 1000);
+setupNavigation(); bindEvents(); refreshHealth(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000);

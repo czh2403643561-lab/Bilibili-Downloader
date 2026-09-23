@@ -1,3 +1,6 @@
+param([switch]$Quiet)
+
+$ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $tools = Join-Path $projectRoot 'tools'
 $bbdownPath = Join-Path $tools 'BBDownNext\BBDown.exe'
@@ -18,5 +21,7 @@ if (-not (Test-Path $ffmpegPath)) {
     Remove-Item -LiteralPath $zipPath, $extractPath -Recurse -Force
 }
 
-Add-Type -AssemblyName PresentationFramework
-[System.Windows.MessageBox]::Show('依赖已安装。现在可双击“启动工具.vbs”启动。', 'Bilibili Downloader') | Out-Null
+if (-not $Quiet) {
+    Add-Type -AssemblyName PresentationFramework
+    [System.Windows.MessageBox]::Show('依赖已安装。现在可双击“启动工具.vbs”启动。', 'Bilibili Downloader') | Out-Null
+}

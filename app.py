@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -28,11 +29,11 @@ ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 TOOLS_DIR = ROOT / "tools"
 BBDOWN = TOOLS_DIR / "BBDownNext" / "BBDown.exe"
-APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
+DEFAULT_APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
+APP_DATA = Path(os.environ.get("BILIBILI_DOWNLOADER_DATA_DIR", DEFAULT_APP_DATA))
 CONFIG_FILE = APP_DATA / "config.json"
 LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
-BBDOWN_PORT = 23667
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -62,12 +63,26 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
-LOG = setup_logging()
+LOG = logging.getLogger(APP_NAME)
+
+
+def configure_data_dir(data_dir: str | None) -> None:
+    """测试可指定隔离目录，正常启动仍只使用当前用户的 AppData。"""
+    global APP_DATA, CONFIG_FILE, LOG_DIR
+    if data_dir:
+        APP_DATA = Path(data_dir).expanduser().resolve()
+        CONFIG_FILE = APP_DATA / "config.json"
+        LOG_DIR = APP_DATA / "logs"
 
 
 def read_config() -> dict:
     try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        directory = str(config.get("download_dir", "")).strip()
+        # 目录已移动或是旧测试临时目录时，视为首次使用，不删除任何用户文件。
+        if directory and not Path(directory).is_dir():
+            config["download_dir"] = ""
+        return config
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {"download_dir": ""}
 
@@ -89,7 +104,14 @@ class BBDownService:
         self.process: subprocess.Popen | None = None
         self.token = ""
         self.download_dir = ""
+        self.port = 0
         self.lock = threading.Lock()
+
+    @staticmethod
+    def pick_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            return int(probe.getsockname()[1])
 
     @staticmethod
     def ffmpeg_available() -> bool:
@@ -135,8 +157,9 @@ class BBDownService:
                 return True, ""
             self.stop()
             self.token = secrets.token_urlsafe(32)
+            self.port = self.pick_port()
             command = [
-                str(BBDOWN), "serve", "--listen", f"http://127.0.0.1:{BBDOWN_PORT}",
+                str(BBDOWN), "serve", "--listen", f"http://127.0.0.1:{self.port}",
                 "--serve-token", self.token, "--work-dir", download_dir, "--max-concurrent", "1",
             ]
             LOG.info("启动 BBDown 服务，下载目录：%s", download_dir)
@@ -156,7 +179,7 @@ class BBDownService:
                 if self.process.poll() is not None:
                     return False, "BBDownNext 未能启动，请在“设置”中导出诊断日志查看原因。"
                 try:
-                    with LOCAL_OPENER.open(f"http://127.0.0.1:{BBDOWN_PORT}/healthz", timeout=1):
+                    with LOCAL_OPENER.open(f"http://127.0.0.1:{self.port}/healthz", timeout=1):
                         return True, ""
                 except urllib.error.URLError:
                     time.sleep(0.2)
@@ -170,7 +193,7 @@ class BBDownService:
             raise RuntimeError(message)
         payload = None if data is None else json.dumps(data, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
-            f"http://127.0.0.1:{BBDOWN_PORT}{path}", payload, method=method,
+            f"http://127.0.0.1:{self.port}{path}", payload, method=method,
             headers={"Content-Type": "application/json", "X-BBDown-Token": self.token},
         )
         try:
@@ -272,7 +295,12 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             if path == "/api/health":
                 config = read_config()
-                self.send_json({"download_dir": config.get("download_dir", ""), "dependency_problem": SERVICE.dependency_problem()})
+                self.send_json({
+                    "online": True,
+                    "instance_id": getattr(self.server, "instance_id", ""),
+                    "download_dir": config.get("download_dir", ""),
+                    "dependency_problem": SERVICE.dependency_problem(),
+                })
             elif path == "/api/config":
                 self.send_json(read_config())
             elif path == "/api/tasks":
@@ -390,10 +418,16 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--open-browser", action="store_true")
+    parser.add_argument("--data-dir", help="仅供自动化测试使用的配置与日志目录")
+    parser.add_argument("--instance-id", default="", help="启动器用于确认当前本地服务已就绪")
     args = parser.parse_args()
+    configure_data_dir(args.data_dir)
+    global LOG
+    LOG = setup_logging()
     config = read_config()
     SERVICE.download_dir = config.get("download_dir", "")
     server = ThreadingHTTPServer(("127.0.0.1", APP_PORT), Handler)
+    server.instance_id = args.instance_id  # type: ignore[attr-defined]
     LOG.info("本地页面启动：http://127.0.0.1:%s", APP_PORT)
     if args.open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(f"http://127.0.0.1:{APP_PORT}")).start()
