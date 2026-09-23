@@ -37,6 +37,14 @@ LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ALLOWED_COVER_SUFFIX = ".hdslb.com"
+BILIBILI_SPACE_API = "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space"
+BILIBILI_PROFILE_API = "https://api.bilibili.com/x/web-interface/card"
+BILIBILI_SPACE_FEATURES = (
+    "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,forwardListHidden,"
+    "decorationCard,commentsNewVersion,onlyfansAssetsV2,ugcDelete,avatarAutoTheme,"
+    "cardsEnhance,eva3CardOpus,eva3CardVideo,eva3CardComment,eva3CardUser"
+)
+WBI_MIXIN_KEY_TABLE = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52]
 
 
 def redact(value: object) -> str:
@@ -333,6 +341,234 @@ def video_metadata(value: str) -> dict:
     }
 
 
+def parse_up_mid(value: str) -> str:
+    value = value.strip()
+    if value.isdigit():
+        return value
+    match = re.search(r"(?i)(?:https?://)?(?:www\.)?space\.bilibili\.com/(\d+)", value)
+    if match:
+        return match.group(1)
+    raise ValueError("请输入有效的 UP 主主页链接或 mid。")
+
+
+def bilibili_json(url: str, *, referer: str = "https://www.bilibili.com/", extra_headers: dict | None = None) -> tuple[int, dict]:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": referer,
+        "Origin": "https://space.bilibili.com",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    request = urllib.request.Request(
+        url,
+        headers=headers,
+    )
+    try:
+        with LOCAL_OPENER.open(request, timeout=15) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", "replace")
+        try:
+            return error.code, json.loads(body)
+        except json.JSONDecodeError:
+            LOG.warning("B 站接口 HTTP %s：%s", error.code, body[:500])
+            return error.code, {}
+    except urllib.error.URLError as error:
+        raise ValueError("无法连接 B 站获取投稿，请检查网络后重试。") from error
+
+
+ANONYMOUS_COOKIE = ""
+
+
+def anonymous_cookie() -> str:
+    global ANONYMOUS_COOKIE
+    if ANONYMOUS_COOKIE:
+        return ANONYMOUS_COOKIE
+    status, payload = bilibili_json("https://api.bilibili.com/x/frontend/finger/spi")
+    data = payload.get("data") or {}
+    pairs = [f"{cookie_name}={data[data_name]}" for cookie_name, data_name in (("buvid3", "b_3"), ("buvid4", "b_4")) if data.get(data_name)]
+    if status != 200 or not pairs:
+        raise ValueError("B 站匿名访问参数暂时不可用，请稍后重试。")
+    ANONYMOUS_COOKIE = "; ".join(pairs)
+    return ANONYMOUS_COOKIE
+
+
+def wbi_signed_query(params: dict) -> str:
+    status, payload = bilibili_json("https://api.bilibili.com/x/web-interface/nav")
+    data = payload.get("data") or {}
+    wbi_img = data.get("wbi_img") or {}
+    img_url = str(wbi_img.get("img_url") or "")
+    sub_url = str(wbi_img.get("sub_url") or "")
+    img_key = re.search(r"/([^/]+)\.[a-z]+$", img_url)
+    sub_key = re.search(r"/([^/]+)\.[a-z]+$", sub_url)
+    if status != 200 or not img_key or not sub_key:
+        raise ValueError("B 站安全参数暂时不可用，请稍后重试。")
+    raw_key = img_key.group(1) + sub_key.group(1)
+    mixin_key = "".join(raw_key[index] for index in WBI_MIXIN_KEY_TABLE if index < len(raw_key))[:32]
+    signed = {**params, "wts": int(time.time())}
+    clean = {key: re.sub(r"[!'()*]", "", str(value)) for key, value in signed.items()}
+    query = "&".join(f"{key}={urllib.parse.quote(clean[key], safe='')}" for key in sorted(clean))
+    return f"{query}&w_rid={hashlib.md5((query + mixin_key).encode('utf-8')).hexdigest()}"
+
+
+def up_profile(mid: str) -> dict:
+    status, payload = bilibili_json(
+        BILIBILI_PROFILE_API + "?" + urllib.parse.urlencode({"mid": mid}),
+        referer=f"https://space.bilibili.com/{mid}",
+    )
+    code = payload.get("code")
+    if status == 412 or code in {-352, -412}:
+        raise ValueError("B 站暂时要求安全验证，无法获取该 UP 主投稿。")
+    if code == -799:
+        raise ValueError("B 站请求过于频繁，请稍后重试。")
+    data = payload.get("data") or {}
+    card = data.get("card") or {}
+    if code != 0 or not card:
+        raise ValueError("找不到该 UP 主或主页不存在。")
+    return {
+        "mid": mid,
+        "name": card.get("name") or "未命名 UP 主",
+        "face": card.get("face") or "",
+        "total": int(data.get("archive_count") or 0),
+    }
+
+
+def duration_seconds(value: str) -> int:
+    try:
+        parts = [int(part) for part in str(value).split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except ValueError:
+        pass
+    return 0
+
+
+def up_period_cutoff(period: str) -> float | None:
+    days = {"year": 365, "half_year": 182, "quarter": 90}.get(period)
+    return time.time() - days * 86400 if days else None
+
+
+def space_feed(query: dict, mid: str) -> tuple[int, dict]:
+    signed_url = BILIBILI_SPACE_API + "?" + wbi_signed_query(query)
+    status, payload = bilibili_json(
+        signed_url,
+        referer=f"https://space.bilibili.com/{mid}",
+        extra_headers={"Cookie": anonymous_cookie()},
+    )
+    data = payload.get("data") or {}
+    # 该公开接口偶尔会对带签名请求返回 code=0 但空列表；再尝试一次兼容的无签名请求。
+    if payload.get("code") == 0 and not (data.get("items") or {}):
+        fallback_status, fallback_payload = bilibili_json(
+            BILIBILI_SPACE_API + "?" + urllib.parse.urlencode(query),
+            referer=f"https://space.bilibili.com/{mid}",
+            extra_headers={"Cookie": anonymous_cookie()},
+        )
+        fallback_data = fallback_payload.get("data") or {}
+        if fallback_payload.get("code") == 0 and fallback_data.get("items"):
+            return fallback_status, fallback_payload
+    return status, payload
+
+
+def normalize_up_item(item: dict, fallback_name: str) -> dict | None:
+    if item.get("type") != "DYNAMIC_TYPE_AV":
+        return None
+    archive = {}
+    author = {}
+    modules = item.get("modules") or []
+    if isinstance(modules, dict):
+        modules = [modules]
+    for module in modules:
+        if not isinstance(module, dict):
+            continue
+        dynamic = module.get("module_dynamic") or {}
+        archive = dynamic.get("dyn_archive") or archive
+        author = module.get("module_author") or author
+    bvid = str(archive.get("bvid") or "").strip()
+    if not bvid:
+        return None
+    pub_ts = int(author.get("pub_ts") or 0)
+    duration_text = str(archive.get("duration_text") or "")
+    return {
+        "bvid": bvid,
+        "url": f"https://www.bilibili.com/video/{bvid}",
+        "title": archive.get("title") or fallback_name,
+        "cover": archive.get("cover") or "",
+        "pub_ts": pub_ts,
+        "publish_time": datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d") if pub_ts else "未知时间",
+        "duration": duration_seconds(duration_text),
+        "duration_text": duration_text or "未知时长",
+    }
+
+
+def fetch_up_page(value: str, offset: str = "", period: str = "all", keyword: str = "", page_size: int = 30) -> dict:
+    mid = parse_up_mid(value)
+    profile = up_profile(mid)
+    page_size = max(1, min(int(page_size or 30), 30))
+    cutoff = up_period_cutoff(period)
+    items: list[dict] = []
+    raw_video_count = 0
+    current_offset = offset or ""
+    seen_offsets: set[str] = set()
+    has_more = True
+    while has_more and len(items) < page_size and current_offset not in seen_offsets:
+        seen_offsets.add(current_offset)
+        query = {
+            "host_mid": mid,
+            "offset": current_offset,
+            "timezone_offset": "-480",
+            "platform": "web",
+            "features": BILIBILI_SPACE_FEATURES,
+            "web_location": "333.1387",
+            "x-bili-device-req-json": json.dumps({"platform": "web", "device": "pc", "spmid": "333.1387"}, separators=(",", ":")),
+            "dm_img_list": "[]",
+            "dm_img_str": "bm8gd2ViZ2",
+            "dm_cover_img_str": "bm8gd2ViZ2",
+            "dm_img_inter": json.dumps({"ds": [], "wh": [0, 0, 0], "of": [0, 0, 0]}, separators=(",", ":")),
+        }
+        status, payload = space_feed(query, mid)
+        code = payload.get("code")
+        if status == 412 or code in {-352, -412}:
+            raise ValueError("B 站暂时要求登录或安全验证，无法获取该 UP 主投稿。")
+        if code == -799:
+            raise ValueError("B 站请求过于频繁，请稍后重试。")
+        if code != 0:
+            LOG.warning("UP 主投稿接口失败 mid=%s code=%s message=%s", mid, code, payload.get("message"))
+            raise ValueError("获取 UP 主投稿失败，请稍后重试。")
+        data = payload.get("data") or {}
+        raw_items = data.get("items") or []
+        reached_cutoff = False
+        for raw_item in raw_items:
+            normalized = normalize_up_item(raw_item, profile["name"])
+            if not normalized:
+                continue
+            raw_video_count += 1
+            if cutoff and normalized["pub_ts"] and normalized["pub_ts"] < cutoff:
+                reached_cutoff = True
+                continue
+            if keyword and keyword.casefold() not in normalized["title"].casefold():
+                continue
+            items.append(normalized)
+            if len(items) >= page_size:
+                break
+        next_offset = str(data.get("offset") or "")
+        has_more = bool(data.get("has_more")) and bool(next_offset) and next_offset != current_offset and not reached_cutoff
+        current_offset = next_offset
+        if reached_cutoff:
+            has_more = False
+    if not items and not keyword and not cutoff and profile["total"] > 0 and raw_video_count == 0:
+        LOG.warning("B 站投稿接口返回空列表 mid=%s profile_total=%s", mid, profile["total"])
+        raise ValueError("B 站暂时没有返回该 UP 主的公开投稿，请稍后重试。")
+    return {
+        "profile": profile,
+        "items": items,
+        "next_offset": current_offset if has_more else "",
+        "has_more": has_more,
+        "total": profile["total"],
+    }
+
+
 def short_error(value: object) -> str:
     text = redact(value or "下载未完成")
     return text[:100] + ("…" if len(text) > 100 else "")
@@ -426,16 +662,28 @@ class Handler(SimpleHTTPRequestHandler):
                 if not BBDOWN.exists():
                     raise ValueError("缺少 BBDownNext：请先双击“安装依赖.ps1”。")
                 self.send_json(video_metadata(str(data.get("url", "")).strip()))
+            elif path == "/api/up":
+                self.send_json(fetch_up_page(
+                    str(data.get("input", "")).strip(),
+                    str(data.get("offset", "")).strip(),
+                    str(data.get("period", "all")).strip(),
+                    str(data.get("keyword", "")).strip(),
+                    int(data.get("page_size", 30) or 30),
+                ))
             elif path == "/api/tasks":
                 pages = [str(page) for page in data.get("pages", []) if str(page).isdigit()]
-                if not pages:
+                all_pages = bool(data.get("all_pages"))
+                if not pages and not all_pages:
                     raise ValueError("请至少选择一个分 P。")
                 mode = data.get("mode")
                 if mode not in {"video", "audio"}:
                     raise ValueError("请选择视频 MP4 或仅音频 M4A。")
+                url = str(data.get("url", "")).strip()
+                if not url:
+                    raise ValueError("下载地址不能为空。")
                 request_data = {
-                    "url": str(data.get("url", "")).strip(),
-                    "pages": ",".join(pages),
+                    "url": url,
+                    "pages": ",".join(pages) if pages else "all",
                     "content": "avmC" if mode == "video" else "a",
                     "mux": "mpeg4",
                     "dfnPriority": "1080P 高码率,1080P60,1080P+,1080P",

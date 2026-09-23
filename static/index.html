@@ -40,7 +40,24 @@
         </div>
       </section>
 
-      <section class="page hidden" id="page-up"><div class="card empty-state"><h2>UP 主批量下载将在下一阶段提供</h2><p>本轮先完成单视频下载闭环。这里会保留为后续的视频列表、筛选和批量选择入口。</p></div></section>
+      <section class="page hidden" id="page-up">
+        <div class="card parse-card">
+          <label for="up-url">UP 主主页或 mid</label>
+          <div class="input-row"><input id="up-url" placeholder="例如 https://space.bilibili.com/24715837 或 24715837" autocomplete="off"><button class="primary" id="up-parse-button">获取投稿</button></div>
+          <p class="hint">只读取公开投稿，不读取浏览器 Cookie；列表按分页加载。</p>
+          <p class="form-message" id="up-message"></p>
+        </div>
+        <div id="up-result" class="hidden">
+          <div class="card up-profile"><img id="up-avatar" alt="UP 主头像"><div><p class="eyebrow">UP 主</p><h2 id="up-name"></h2><p id="up-total" class="muted"></p></div></div>
+          <div class="card">
+            <div class="up-controls"><div><label for="up-period">时间范围</label><select id="up-period"><option value="all">全部</option><option value="year">最近一年</option><option value="half_year">最近半年</option><option value="quarter">最近三个月</option></select></div><div class="up-search"><label for="up-keyword">标题搜索</label><input id="up-keyword" placeholder="输入标题关键词" autocomplete="off"></div><button class="secondary" id="up-filter-button">应用筛选</button></div>
+            <div class="section-heading up-selection-heading"><div><h2>投稿列表</h2><p id="up-selected-count">已选择 0 个</p></div><div class="button-group"><button class="secondary" id="up-select-page">全选当前页</button><button class="secondary" id="up-clear-page">取消当前页</button><button class="secondary" id="up-clear-selected">清空已选</button></div></div>
+            <div id="up-list" class="up-list"></div><div id="up-empty" class="task-empty hidden">没有符合条件的公开视频投稿</div>
+            <div class="up-footer"><button class="secondary" id="up-prev">上一页</button><span id="up-page-label">第 1 页</span><button class="secondary" id="up-next">下一页</button></div>
+          </div>
+          <div class="card download-options"><div><h2>批量下载格式</h2><p>每个投稿单独加入任务；多 P 默认下载全部分 P，视频最高 1080P。</p></div><div class="segmented"><label><input type="radio" name="up-mode" value="video" checked><span>视频 MP4</span></label><label><input type="radio" name="up-mode" value="audio"><span>仅音频 M4A</span></label></div><button class="primary" id="up-download-button">加入下载任务</button></div>
+        </div>
+      </section>
 
       <section class="page hidden" id="page-settings"><div class="card settings-row"><div><h2>默认下载目录</h2><p id="download-dir" class="muted">尚未设置</p></div><button class="secondary" id="choose-dir">修改目录</button></div><div class="card settings-row"><div><h2>诊断日志</h2><p class="muted">日志已自动脱敏，不会记录 Cookie 或 Token。</p></div><div class="button-group"><button class="secondary" id="open-logs">打开日志目录</button><button class="secondary" id="export-logs">导出诊断日志</button></div></div></section>
 
