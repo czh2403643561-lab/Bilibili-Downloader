@@ -296,6 +296,7 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/health":
                 config = read_config()
                 self.send_json({
+                    "app": APP_NAME,
                     "online": True,
                     "instance_id": getattr(self.server, "instance_id", ""),
                     "download_dir": config.get("download_dir", ""),
