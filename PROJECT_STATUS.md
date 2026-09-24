@@ -10,10 +10,13 @@
 - 已增加统一转写引擎设置：本地 FunASR、`mimo-v2.5-asr`、`mimo-v2.6-flash`；默认本地，任务创建时记录实际 provider/model。
 - MiMo API Key 使用独立 Windows DPAPI 文件保存，`config.json` 仅保存引擎选择；设置接口只返回已配置状态和脱敏提示。
 - MiMo 适配已按官方 OpenAI Chat Completions 结构实现：v2.5 使用 MP3/WAV、`asr_options.language=zh`；v2.6 使用忠实转写 prompt；两者都支持 FFmpeg 转 MP3、长音频切片、有限退避重试和临时文件清理。
-- MiMo 结果不伪造时间戳；无可靠时间戳时仅提供全文/TXT，时间轴和 SRT/VTT 会禁用。
+- 文字稿现以正文展示，只提供复制全文与 TXT；不展示时间轴、发言人或字幕导出。
 - MiMo Flash 已关闭 thinking，并将单片段 `max_completion_tokens` 提高到 65536；保留现有切片、顺序合并和有限重试流程。
 - MiMo 每个片段现在记录 provider/model、片段序号、音频字节数、HTTP 状态、finish_reason、安全 usage 数值、正文/推理正文长度；不记录 API Key、Base64、请求体或转写正文，并拒绝空正文和异常/长度 finish_reason。
 - 诊断 ZIP 已改为写入现有 `LOG_DIR`；创建前 flush 日志，创建成功与 Explorer 定位分离，不再直接打开 ZIP 文件。
+- 转写任务和结果按任务 ID 独立保存在 AppData 的 `transcription-history`；启动时恢复成功/失败历史，并将残留运行任务标记为中断。清理只删除相应 JSON 历史，不操作源音频、下载目录或用户导出的 TXT。
+- 转写文本只剥除行首明确匹配的“时间范围 | speaker/发言人:”元数据，并按现有标点、换行和长度确定性分段；不做语义改写。新 Flash prompt 要求原话、无时间戳/发言人标签并按自然段输出。
+- 任务列表支持点击切换独立文字稿与批量清理；默认隐藏复选框，管理模式下运行任务不能选择删除。新任务及进度刷新保留用户当前查看项。
 
 ## 已通过的测试
 
@@ -27,6 +30,11 @@
 - 使用本地模拟 HTTP 响应验证两个 MiMo provider 的请求结构、v2.5 `language=zh`、v2.6 忠实转写 prompt、音频切片和无时间戳结果；该模拟测试未发起计费云端请求。
 - 使用本地模拟响应验证 Flash `thinking.type=disabled`、65536 输出预算、成功正文和空正文失败路径；日志仅输出安全元数据。
 - 实测 `/api/export-logs` 创建 ZIP 成功，ZIP 位于 `LOG_DIR` 且可读取，包含当前日志文件；实测 `/api/open-log-directory` 返回成功。
+- 本轮临时 AppData 测试创建三个不同引擎的任务，确认结果互不覆盖，成功/失败历史均可重载；残留运行任务重载后标记中断。
+- 隔离 HTTP API 测试确认单项删除只移除对应历史 JSON；清除全部会保留运行任务，且源音频与已导出 TXT 不受影响；非法任务 ID 会被拒绝。
+- 临时浏览器页面实测 A/B 点击显示各自正文；进度刷新不改变当前查看项；默认复选框隐藏，管理模式显示三个复选框并禁用运行中的 C，选择框与任务点击不冲突。
+- 模拟 Flash 响应验证新 prompt 要求及安全去前缀逻辑；普通 MP4/M4A 下载接口通过 mock 检查仍映射到原视频/音频模式，未实际启动下载。
+- `python -m py_compile app.py`、`node --check static/app.js`、`node --check static/asr.js`、`git diff --check`。
 
 ## 未完成 / 尚未验证
 
@@ -35,7 +43,8 @@
 - 本轮未启用领域热词或错词纠正。
 - 已使用当前本机已保存的 MiMo Key 完成受控真实验证：`/models` 认证通过；20 秒 M4A 的 Flash 单片段成功返回 209 字符；约 15 分钟 MP3 实际切为 2 片，两片均 HTTP 200、`finish_reason=stop`，最终任务成功并合并 5729 字符。
 - v2.5-ASR 尚未重新发起真实计费请求；此前仅完成请求结构模拟验证。
+- 本轮正文历史功能使用隔离模拟任务/浏览器数据验收，没有重新发起真实 FunASR 或 MiMo 识别，也未实际生成下载或 TXT 文件。
 
 ## 下一步
 
-- 下一步仅需按需补做 v2.5-ASR 的一次短音频真实 A/B 请求，以及页面级按钮回归；Flash 长音频问题已通过本轮真实复测。
+- 后续按需补做本地 FunASR、MiMo 两个模型的短音频回归，以及用户环境中的 TXT 实际导出和普通下载页面回归；本轮 Flash 长音频问题已有真实复测结果。

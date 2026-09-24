@@ -702,7 +702,7 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
             messages = [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": audio_data}}]}]
             payload = {"model": model, "messages": messages, "asr_options": {"language": "zh"}}
         else:
-            messages = [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": audio_data}}, {"type": "text", "text": "忠实转写音频原话，不总结、不润色、不补充内容。"}]}]
+            messages = [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": audio_data}}, {"type": "text", "text": "忠实转写音频原话，不总结、不润色、不补充内容；不要输出时间戳、speaker 或发言人标签；按自然语义和话题停顿整理成正常中文段落。"}]}]
             payload = {
                 "model": model,
                 "messages": messages,
@@ -768,6 +768,11 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
 
 TRANSCRIPTION_LOCK = threading.RLock()
 TRANSCRIPTION_TASKS: dict[str, dict] = {}
+TRANSCRIPTION_ACTIVE_STATUSES = {"queued", "downloading", "uploading", "processing"}
+TRANSCRIPTION_HISTORY_FIELDS = (
+    "task_id", "name", "source_url", "source_title", "status", "stage", "progress", "error",
+    "result", "filename", "created_at", "finished_at", "parent_id", "provider", "model",
+)
 ASR_SERVICE_HOST = "127.0.0.1"
 ASR_SERVICE_PORT = 8765
 TRANSCRIPTION_AUDIO_SUFFIXES = {".m4a", ".mka", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".opus"}
@@ -779,12 +784,121 @@ def transcription_root() -> Path:
     return root
 
 
+def transcription_history_dir() -> Path:
+    return APP_DATA / "transcription-history"
+
+
+TRANSCRIPTION_META_PREFIX = re.compile(
+    r"^\s*(?:\d{1,3}[.,]\d{1,3}|\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)"
+    r"\s*[-–—]\s*(?:\d{1,3}[.,]\d{1,3}|\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)"
+    r"\s*\|\s*(?:SPEAKER_\d{1,3}|(?:发言人|主讲人|说话人)(?:\s*\d{1,3})?)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+
+
+def normalize_transcript_text(value: object) -> str:
+    """只清理明确的逐行转写元数据，并用原字词做确定性自然分段。"""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    cleaned_lines = [TRANSCRIPTION_META_PREFIX.sub("", line, count=1).strip() for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    paragraphs: list[str] = []
+    run: list[str] = []
+
+    def flush_run() -> None:
+        if not run:
+            return
+        joined = ""
+        for line in run:
+            if joined and joined[-1:].isascii() and joined[-1:].isalnum() and line[:1].isascii() and line[:1].isalnum():
+                joined += " "
+            joined += line
+        sentences = re.split(r"(?<=[。！？!?；;])|(?<!\d)(?<=\.)(?=\s|$)", joined)
+        current = ""
+        for sentence in sentences:
+            if not sentence:
+                continue
+            units: list[str] = []
+            while len(sentence) > 280:
+                boundary = max((match.end() for match in re.finditer(r"[，,、；;]", sentence[:280])), default=0)
+                boundary = boundary if boundary >= 140 else 280
+                units.append(sentence[:boundary])
+                sentence = sentence[boundary:]
+            if sentence:
+                units.append(sentence)
+            for unit in units:
+                if current and len(current) >= 180:
+                    paragraphs.append(current.strip())
+                    current = ""
+                current += unit
+        if current.strip():
+            paragraphs.append(current.strip())
+        run.clear()
+
+    for line in cleaned_lines:
+        if line:
+            run.append(line)
+        else:
+            flush_run()
+    flush_run()
+    return "\n\n".join(paragraphs)
+
+
+def persist_transcription(task: dict) -> None:
+    task_id = str(task.get("task_id") or "")
+    if not re.fullmatch(r"[a-f0-9]{24}", task_id):
+        return
+    history_dir = transcription_history_dir()
+    path = history_dir / f"{task_id}.json"
+    temp_path = history_dir / f"{task_id}.json.tmp"
+    record = {key: task.get(key) for key in TRANSCRIPTION_HISTORY_FIELDS}
+    try:
+        history_dir.mkdir(parents=True, exist_ok=True)
+        temp_path.write_text(json.dumps(record, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        os.replace(temp_path, path)
+    except (OSError, TypeError, ValueError):
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        LOG.warning("无法保存转写历史 task_id=%s", task_id)
+
+
+def load_transcription_history() -> None:
+    history_dir = transcription_history_dir()
+    history_dir.mkdir(parents=True, exist_ok=True)
+    recovered: dict[str, dict] = {}
+    for path in history_dir.glob("*.json"):
+        try:
+            task = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOG.warning("忽略无法读取的转写历史文件：%s", path.name)
+            continue
+        if not isinstance(task, dict) or not re.fullmatch(r"[a-f0-9]{24}", str(task.get("task_id") or "")):
+            continue
+        if task.get("status") in TRANSCRIPTION_ACTIVE_STATUSES:
+            task.update(
+                status="failed",
+                stage="任务已中断",
+                progress=0,
+                error="程序关闭时任务仍在运行，已标记中断；请重新创建任务。",
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        recovered[task["task_id"]] = {key: task.get(key) for key in TRANSCRIPTION_HISTORY_FIELDS}
+    with TRANSCRIPTION_LOCK:
+        TRANSCRIPTION_TASKS.update(recovered)
+        for task in recovered.values():
+            if task.get("stage") == "任务已中断":
+                persist_transcription(task)
+
+
 def public_transcription(task: dict) -> dict:
-    fields = (
-        "task_id", "name", "source_url", "source_title", "status", "stage", "progress",
-        "error", "result", "filename", "created_at", "finished_at", "parent_id", "provider", "model",
-    )
-    return {key: task.get(key) for key in fields}
+    public = {key: task.get(key) for key in TRANSCRIPTION_HISTORY_FIELDS}
+    result = public.get("result")
+    if isinstance(result, dict):
+        result = dict(result)
+        result["text"] = normalize_transcript_text(result.get("text"))
+        public["result"] = result
+    return public
 
 
 def update_transcription(task_id: str, **fields: object) -> dict | None:
@@ -793,6 +907,10 @@ def update_transcription(task_id: str, **fields: object) -> dict | None:
         if task is None:
             return None
         task.update(fields)
+        if isinstance(task.get("result"), dict):
+            task["result"] = dict(task["result"])
+            task["result"]["text"] = normalize_transcript_text(task["result"].get("text"))
+        persist_transcription(task)
         return dict(task)
 
 
@@ -825,7 +943,48 @@ def new_transcription_task(source: dict, *, parent_id: str | None = None, filena
     }
     with TRANSCRIPTION_LOCK:
         TRANSCRIPTION_TASKS[task_id] = task
+        persist_transcription(task)
     return task
+
+
+def delete_transcription_history(task_ids: list[str] | None = None, *, clear_all: bool = False) -> dict[str, list[str]]:
+    selected = set(task_ids or [])
+    if not clear_all and any(not re.fullmatch(r"[a-f0-9]{24}", task_id) for task_id in selected):
+        raise ValueError("转写任务编号无效。")
+    deleted: list[str] = []
+    skipped: list[str] = []
+    with TRANSCRIPTION_LOCK:
+        candidates = list(TRANSCRIPTION_TASKS) if clear_all else list(selected)
+        for task_id in candidates:
+            task = TRANSCRIPTION_TASKS.get(task_id)
+            if task is None:
+                continue
+            if task.get("status") in TRANSCRIPTION_ACTIVE_STATUSES:
+                skipped.append(task_id)
+                continue
+            history_path = transcription_history_dir() / f"{task_id}.json"
+            try:
+                history_path.with_suffix(".json.tmp").unlink(missing_ok=True)
+                history_path.unlink(missing_ok=True)
+            except OSError as error:
+                LOG.warning("无法删除转写历史 task_id=%s error=%s", task_id, short_error(error))
+                skipped.append(task_id)
+                continue
+            del TRANSCRIPTION_TASKS[task_id]
+            deleted.append(task_id)
+        if clear_all:
+            active_ids = {task_id for task_id, task in TRANSCRIPTION_TASKS.items() if task.get("status") in TRANSCRIPTION_ACTIVE_STATUSES}
+            history_dir = transcription_history_dir()
+            for path in (*history_dir.glob("*.json"), *history_dir.glob("*.json.tmp")):
+                task_id = path.name.removesuffix(".json.tmp") if path.name.endswith(".json.tmp") else path.stem
+                if task_id in active_ids:
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as error:
+                    LOG.warning("无法清理转写历史缓存 task_id=%s error=%s", task_id, short_error(error))
+                    skipped.append(task_id)
+    return {"deleted": deleted, "skipped": skipped}
 
 
 def asr_error_message(payload: object, fallback: str) -> str:
@@ -1700,6 +1859,10 @@ class Handler(SimpleHTTPRequestHandler):
             shutil.rmtree(temp_dir, ignore_errors=True)
             with TRANSCRIPTION_LOCK:
                 TRANSCRIPTION_TASKS.pop(task["task_id"], None)
+            try:
+                (transcription_history_dir() / f"{task['task_id']}.json").unlink(missing_ok=True)
+            except OSError:
+                LOG.warning("无法清理未提交的转写历史 task_id=%s", task["task_id"])
             raise ValueError("无法保存本地音频文件。")
         threading.Thread(target=run_manual_transcription, args=(task["task_id"], audio_path, temp_dir), daemon=True).start()
         self.send_json({"item": public_transcription(task)}, HTTPStatus.ACCEPTED)
@@ -1940,6 +2103,25 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 self.send_json({"error": "发生意外错误，请导出诊断日志查看详情。"}, 500)
 
+    def do_DELETE(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            if path != "/api/transcriptions":
+                self.send_json({"error": "未找到接口。"}, 404)
+                return
+            data = self.read_json()
+            clear_all = data.get("clear_all") is True
+            task_ids = data.get("task_ids")
+            if not clear_all and (not isinstance(task_ids, list) or not task_ids or not all(isinstance(item, str) for item in task_ids)):
+                raise ValueError("请先选择要删除的转写任务。")
+            result = delete_transcription_history(task_ids if isinstance(task_ids, list) else None, clear_all=clear_all)
+            self.send_json(result)
+        except (RuntimeError, ValueError) as error:
+            self.send_json({"error": short_error(error)}, 400)
+        except Exception as error:
+            LOG.exception("删除转写历史失败：%s", error)
+            self.send_json({"error": "删除转写历史失败，请稍后重试。"}, 500)
+
     def serve_static(self, path: str) -> None:
         relative = "index.html" if path in {"/", ""} else path.lstrip("/")
         candidate = (STATIC_DIR / relative).resolve()
@@ -1972,6 +2154,7 @@ def main() -> None:
     configure_data_dir(args.data_dir)
     global LOG
     LOG = setup_logging()
+    load_transcription_history()
     config = read_config()
     SERVICE.download_dir = config.get("download_dir", "")
     server = ThreadingHTTPServer(("127.0.0.1", APP_PORT), Handler)
