@@ -26,6 +26,25 @@ SAFE_REQUEST_HEADERS = {
     "referer", "user-agent", "range",
 }
 LOG = logging.getLogger("BilibiliDownloader")
+AUTH_PROBE_PATHS = {
+    "/wemeet-tapi/v2/login-logic/user/query-detail",
+    "/wemeet-webapi/v2/account/login/refresh-token",
+}
+QR_VISIBLE_SELECTOR = '[class*="qr-code-wrapper"]'
+
+
+class MeetingFlowError(RuntimeError):
+    def __init__(self, message: str, reason_code: str):
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+def account_response_authenticated(http_status: int, payload: object) -> bool:
+    """只接受腾讯网页自身认证接口的明确成功响应；不查看或保存身份字段。"""
+    if http_status != 200 or not isinstance(payload, dict) or payload.get("code") != 0:
+        return False
+    data = payload.get("data")
+    return isinstance(data, (dict, list)) and bool(data)
 
 
 def validate_recording_url(value: str) -> str:
@@ -147,6 +166,7 @@ class MeetingBrowserService:
 
     def _run_browser_operation(self, initial_status: str, operation) -> None:
         started = time.monotonic()
+        operation_name = {"waiting_login": "login", "checking": "verify", "parsing": "parse"}.get(initial_status, "browser")
         try:
             with self._operation_lock:
                 if self._closed.is_set():
@@ -175,13 +195,14 @@ class MeetingBrowserService:
                     playwright.stop()
         except Exception as error:
             message = self._friendly_error(error)
-            LOG.warning("腾讯会议浏览器操作失败 status=%s kind=%s", initial_status, type(error).__name__)
+            reason = getattr(error, "reason_code", "BROWSER_OPERATION_FAILED")
+            LOG.warning("meeting operation failed operation=%s reason=%s elapsed=%.1fs", operation_name, reason, time.monotonic() - started)
             with self._state_lock:
                 self._verified_login = False if initial_status != "parsing" else self._verified_login
                 self._last_verified = time.monotonic()
                 self._state = {"status": "failed", "message": message, "logged_in": self._verified_login}
         else:
-            LOG.info("腾讯会议浏览器操作完成 status=%s elapsed=%.1fs", initial_status, time.monotonic() - started)
+            LOG.info("meeting operation complete operation=%s elapsed=%.1fs", operation_name, time.monotonic() - started)
 
     def _playwright_module(self):
         packages = self._app_data_provider() / "python-packages"
@@ -223,38 +244,118 @@ class MeetingBrowserService:
         raise RuntimeError("未找到 Microsoft Edge 或 Google Chrome，请安装其中一个浏览器后重试。")
 
     def _login_operation(self, runtime) -> None:
-        _, context = runtime
+        playwright, context = runtime
         page = context.pages[0] if context.pages else context.new_page()
+        probe = {"authenticated": False, "seen": False, "sequence": 0}
+        page.on("response", lambda response: self._capture_account_signal(response, probe))
         page.goto(MEETING_HOME, wait_until="domcontentloaded", timeout=60000)
-        self._click_login_entry(page)
+        page.wait_for_timeout(900)
+        before_authenticated = self._is_authenticated(page, probe["authenticated"])
+        before_sequence = probe["sequence"]
+        LOG.info("meeting login opened auth_signal=%s", "AUTHENTICATED" if before_authenticated else "UNAUTHENTICATED")
+        if not before_authenticated:
+            self._click_login_entry(page)
         with self._state_lock:
-            self._state = {"status": "waiting_login", "message": "请在腾讯会议官方窗口中使用微信扫码登录。", "logged_in": False}
+            self._state = {
+                "status": "checking" if before_authenticated else "waiting_login",
+                "message": "正在用独立会话确认登录…" if before_authenticated else "请在腾讯会议官方窗口中使用微信扫码登录。",
+                "logged_in": False,
+            }
         deadline = time.monotonic() + LOGIN_TIMEOUT_SECONDS
+        qr_logged = False
+        stable_count = 0
+        last_probe = before_authenticated
         while time.monotonic() < deadline and not self._cancel.is_set() and not self._closed.is_set():
-            if self._is_logged_in(page):
-                with self._state_lock:
-                    self._verified_login = True
-                    self._last_verified = time.monotonic()
-                    self._state = {"status": "logged_in", "message": "腾讯会议已登录", "logged_in": True}
-                return
-            time.sleep(1)
+            qr_visible = self._qr_login_visible(page)
+            if qr_visible:
+                stable_count = 0
+                if not qr_logged:
+                    LOG.info("meeting login qr_visible=true")
+                    qr_logged = True
+            elif before_authenticated or (probe["authenticated"] and probe["sequence"] > before_sequence):
+                stable_count += 1
+                if last_probe is not True:
+                    LOG.info("meeting login auth_signal=ACCOUNT_ENDPOINT")
+                last_probe = True
+                if stable_count >= 3:
+                    break
+            else:
+                stable_count = 0
+                last_probe = False
+            page.wait_for_timeout(500)
         if self._cancel.is_set() or self._closed.is_set():
-            raise RuntimeError("登录操作已关闭。")
-        raise RuntimeError("等待扫码登录超时（5 分钟），请重新尝试。")
+            raise MeetingFlowError("登录操作已关闭。", "LOGIN_CANCELLED")
+        if stable_count < 3:
+            raise MeetingFlowError("等待扫码登录超时（5 分钟），请重新尝试。", "AUTH_SIGNAL_NOT_CONFIRMED")
+
+        # Release the visible profile lock before reopening the same profile headlessly.
+        with self._state_lock:
+            self._state = {"status": "checking", "message": "已检测到扫码状态，正在验证登录是否已保存…", "logged_in": False}
+        context.close()
+        try:
+            persisted = self._verify_saved_profile(playwright)
+        except Exception:
+            LOG.info("meeting login verified_in_new_context=false")
+            self._verified_login = False
+            raise MeetingFlowError("扫码已完成，但登录状态未能保存，请重试。", "PROFILE_SESSION_NOT_PERSISTED") from None
+        LOG.info("meeting login verified_in_new_context=%s", str(persisted).lower())
+        if not persisted:
+            self._verified_login = False
+            raise MeetingFlowError("扫码已完成，但登录状态未能保存，请重试。", "PROFILE_SESSION_NOT_PERSISTED")
+        with self._state_lock:
+            self._verified_login = True
+            self._last_verified = time.monotonic()
+            self._state = {"status": "logged_in", "message": "腾讯会议已登录", "logged_in": True}
 
     def _verify_operation(self, runtime) -> None:
         _, context = runtime
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(MEETING_HOME, wait_until="domcontentloaded", timeout=60000)
-        logged_in = self._is_logged_in(page)
+        logged_in = self._probe_account_page(page)
         with self._state_lock:
             self._verified_login = logged_in
             self._last_verified = time.monotonic()
+            LOG.info("meeting login auth_signal=%s", "ACCOUNT_ENDPOINT" if logged_in else "UNAUTHENTICATED")
             self._state = {
                 "status": "logged_in" if logged_in else "logged_out",
                 "message": "腾讯会议已登录" if logged_in else "登录已失效，请重新扫码",
                 "logged_in": logged_in,
             }
+
+    def _verify_saved_profile(self, playwright) -> bool:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(self.profile_dir),
+            executable_path=str(self._browser_executable()),
+            headless=True,
+            accept_downloads=False,
+            args=["--disable-blink-features=AutomationControlled"],
+            timeout=30000,
+        )
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            return self._probe_account_page(page)
+        finally:
+            context.close()
+
+    def _probe_account_page(self, page) -> bool:
+        probe = {"authenticated": False, "seen": False, "sequence": 0}
+        page.on("response", lambda response: self._capture_account_signal(response, probe))
+        page.goto(MEETING_HOME, wait_until="domcontentloaded", timeout=60000)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not probe["seen"]:
+            page.wait_for_timeout(150)
+        return self._is_authenticated(page, probe["authenticated"])
+
+    @staticmethod
+    def _capture_account_signal(response, probe: dict[str, Any]) -> None:
+        parts = urllib.parse.urlsplit(response.url)
+        if parts.hostname != "meeting.tencent.com" or parts.path not in AUTH_PROBE_PATHS:
+            return
+        probe["seen"] = True
+        probe["sequence"] = int(probe.get("sequence", 0)) + 1
+        try:
+            probe["authenticated"] = account_response_authenticated(response.status, response.json())
+        except Exception:
+            probe["authenticated"] = False
 
     def _parse_operation(self, runtime, recording_url: str) -> None:
         _, context = runtime
@@ -278,17 +379,23 @@ class MeetingBrowserService:
                 return
 
         page.on("response", on_response)
+        LOG.info("meeting parse stage=navigation")
         response = page.goto(recording_url, wait_until="domcontentloaded", timeout=90000)
-        if self._looks_like_login_redirect(page.url, page.title()):
+        access, player_found, message = self._classify_recording_access(page, response)
+        if access == "LOGIN_REQUIRED":
             with self._state_lock:
                 self._verified_login = False
                 self._last_verified = time.monotonic()
-                self._state = {"status": "logged_out", "message": "腾讯会议登录已失效，请重新扫码后解析。", "logged_in": False}
+                self._state = {"status": "logged_out", "message": message, "logged_in": False}
+            LOG.info("meeting parse access=login_required reason=LOGIN_REQUIRED")
             return
-        if not self._is_logged_in(page):
-            raise RuntimeError("无法确认腾讯会议登录状态；请先在设置中完成官方扫码登录。")
-        if response is not None and response.status >= 400:
-            raise RuntimeError(f"腾讯会议回放页面返回 HTTP {response.status}。请确认链接有效且当前账号有访问权限。")
+        if access == "RECORDING_ACCESS_DENIED":
+            LOG.info("meeting parse access=denied reason=RECORDING_ACCESS_DENIED")
+            raise MeetingFlowError(message, "RECORDING_ACCESS_DENIED")
+        if access != "RECORDING_PAGE":
+            LOG.info("meeting parse access=unconfirmed player_found=%s", str(player_found).lower())
+            raise MeetingFlowError("未能确认已进入腾讯会议回放页面。请确认链接有效后重试。", "RECORDING_PAGE_NOT_CONFIRMED")
+        LOG.info("meeting parse access=recording_page player_found=%s", str(player_found).lower())
         try:
             page.locator("video").evaluate_all("els => els.forEach(v => { v.muted = true; v.preload = 'auto'; })")
             page.locator("video").first.evaluate("v => v.play().catch(() => {})")
@@ -298,9 +405,12 @@ class MeetingBrowserService:
         while time.monotonic() < deadline and not candidates and not self._cancel.is_set():
             page.wait_for_timeout(500)
         if self._cancel.is_set():
-            raise RuntimeError("解析已取消。")
+            raise MeetingFlowError("解析已取消。", "PARSE_CANCELLED")
         if not candidates:
-            raise RuntimeError("页面未发现可用的 MP4 视频流。请确认该回放可播放，并且账号有查看权限。")
+            reason = "PLAYER_NOT_FOUND" if not player_found else "MEDIA_NOT_FOUND"
+            LOG.info("meeting parse media_candidates=0 reason=%s", reason)
+            message = "已进入回放页面，但未发现播放器。" if reason == "PLAYER_NOT_FOUND" else "页面未发现可用的 MP4 视频流。请确认回放可播放。"
+            raise MeetingFlowError(message, reason)
         videos = page.locator("video").evaluate_all("els => els.map(v => ({duration: Number.isFinite(v.duration) ? v.duration : null, title: v.getAttribute('aria-label') || ''}))")
         duration = next((int(round(item["duration"])) for item in videos if item.get("duration") and item["duration"] > 0), None)
         title = self._clean_title(page.title())
@@ -317,6 +427,9 @@ class MeetingBrowserService:
         }
         if media:
             result["media"] = media
+        if not media:
+            LOG.info("meeting parse media_candidates=%s reason=MULTIPLE_MEDIA", len(candidates))
+            raise MeetingFlowError("检测到多个 MP4 视频流，无法安全确定唯一下载源。", "MULTIPLE_MEDIA")
         with self._state_lock:
             now = time.time()
             self._results = {key: item for key, item in self._results.items() if item["expires_at"] > now}
@@ -324,33 +437,86 @@ class MeetingBrowserService:
             self._verified_login = True
             self._last_verified = time.monotonic()
             self._state = {
-                "status": "parsed", "message": "回放解析完成" if media else "发现多个视频流，无法安全确定唯一下载源",
+                "status": "parsed", "message": "回放解析完成",
                 "logged_in": True, "result": {key: value for key, value in result.items() if key not in {"expires_at", "media"}},
             }
+        LOG.info("meeting parse media_candidates=%s", len(candidates))
 
-    def _is_logged_in(self, page) -> bool:
-        if self._looks_like_login_redirect(page.url, page.title()):
+    def _is_authenticated(self, page, account_signal: bool) -> bool:
+        # A visible login QR takes precedence over any stale/homepage DOM indicators.
+        if self._qr_login_visible(page):
             return False
-        for selector in (
-            '[aria-label*="个人中心"]', '[aria-label*="个人信息"]', '[data-testid*="avatar"]',
-            '[class*="user-avatar"]', '[class*="userAvatar"]', '[class*="user-info"]',
-        ):
-            try:
-                if page.locator(selector).first.is_visible(timeout=150):
-                    return True
-            except Exception:
-                continue
+        return bool(account_signal)
+
+    @staticmethod
+    def _qr_login_visible(page) -> bool:
         try:
-            text = page.locator("body").inner_text(timeout=1000)
-            return any(marker in text for marker in ("退出登录", "个人中心", "账号设置"))
+            locator = page.locator(QR_VISIBLE_SELECTOR).first
+            return locator.is_visible(timeout=150)
         except Exception:
             return False
 
+    def _classify_recording_access(self, page, response) -> tuple[str, bool, str]:
+        if self._recording_login_required(page):
+            return "LOGIN_REQUIRED", False, "腾讯会议登录已失效，请重新扫码后解析。"
+        status = getattr(response, "status", 200) if response is not None else 200
+        alert_text = self._recording_alert_text(page)
+        denied_text = re.compile(r"无权限|没有权限|无权访问|没有访问权限|回放不存在|录制不存在|已删除|已过期|内容不存在")
+        if status in {401, 403, 404} or denied_text.search(alert_text):
+            return "RECORDING_ACCESS_DENIED", False, "当前账号无权访问该回放，或回放已不存在。"
+        video_count = 0
+        try:
+            video_count = page.locator("video").count()
+        except Exception:
+            pass
+        player_found = video_count > 0
+        final = urllib.parse.urlsplit(page.url)
+        is_recording_route = final.hostname == "meeting.tencent.com" and bool(re.match(r"^/(?:cw|crm)/", final.path, re.I))
+        if status < 400 and (is_recording_route or player_found):
+            return "RECORDING_PAGE", player_found, ""
+        return "UNCONFIRMED", player_found, ""
+
     @staticmethod
-    def _looks_like_login_redirect(url: str, title: str) -> bool:
+    def _recording_alert_text(page) -> str:
+        snippets = []
+        for selector in ('[role="alert"]', '[class*="toast"]', '[class*="error-message"]', '[class*="empty-state"]'):
+            try:
+                for locator in page.locator(selector).all()[:5]:
+                    if locator.is_visible(timeout=100):
+                        snippets.append(locator.inner_text(timeout=1000)[:200])
+            except Exception:
+                continue
+        return " ".join(snippets)
+
+    def _recording_login_required(self, page) -> bool:
+        for frame in page.frames:
+            if self._is_explicit_login_redirect(frame.url):
+                if frame == page.main_frame:
+                    return True
+                try:
+                    if frame.frame_element().is_visible(timeout=100):
+                        return True
+                except Exception:
+                    continue
+        if self._qr_login_visible(page):
+            return True
+        for selector in ('[role="dialog"]', '[class*="login-modal"]', '[class*="login-dialog"]'):
+            try:
+                for locator in page.locator(selector).all()[:5]:
+                    if locator.is_visible(timeout=100) and re.search(r"登录|扫码", locator.inner_text(timeout=1000)):
+                        return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _is_explicit_login_redirect(url: str) -> bool:
         parsed = urllib.parse.urlsplit(url)
-        login_path = bool(re.search(r"/(?:login|signin|passport)(?:/|$)", parsed.path, re.I))
-        return parsed.hostname != "meeting.tencent.com" or login_path or "登录" in title
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
+        official_host = host == "meeting.tencent.com" or host.endswith(".tencent.com") or host == "qq.com" or host.endswith(".qq.com")
+        login_path = bool(re.search(r"/(?:login(?:\.html)?|signin|passport)(?:/|$)", path)) or "/wwlogin/" in path or "/connect/qrconnect" in path
+        return official_host and login_path
 
     @staticmethod
     def _click_login_entry(page) -> None:
