@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import cgi
 import ctypes
 import http.client
 from ctypes import wintypes
@@ -11,6 +12,7 @@ import html
 import json
 import hashlib
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -42,10 +44,17 @@ DEFAULT_APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 APP_DATA = Path(os.environ.get("BILIBILI_DOWNLOADER_DATA_DIR", DEFAULT_APP_DATA))
 CONFIG_FILE = APP_DATA / "config.json"
 AUTH_FILE = APP_DATA / "bilibili-auth.dat"
+MIMO_AUTH_FILE = APP_DATA / "mimo-auth.dat"
 QR_PACKAGE_DIR = APP_DATA / "python-packages"
 LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+MIMO_BASE_URL = "https://api.xiaomimimo.com/v1"
+TRANSCRIPTION_PROVIDERS = {
+    "local": {"label": "本地 FunASR", "model": "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"},
+    "mimo-v2.5-asr": {"label": "小米 MiMo-V2.5-ASR", "model": "mimo-v2.5-asr"},
+    "mimo-v2.6-flash": {"label": "小米 MiMo-V2.6-Flash", "model": "mimo-v2.6-flash"},
+}
 ALLOWED_COVER_SUFFIX = ".hdslb.com"
 BILIBILI_SPACE_API = "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space"
 BILIBILI_ARC_SEARCH_API = "https://api.bilibili.com/x/space/wbi/arc/search"
@@ -69,7 +78,7 @@ UP_FILTER_CACHE: dict[tuple[str, str, str], list[dict]] = {}
 def redact(value: object) -> str:
     """避免诊断日志意外记录 Cookie、token 或带敏感查询参数的链接。"""
     text = str(value)
-    text = re.sub(r"(?i)(cookie|token|sessdata|access_token|refresh_token|qrcode_key)([=:])[^\s,&;]+", r"\1\2<已脱敏>", text)
+    text = re.sub(r"(?i)(cookie|token|sessdata|access_token|refresh_token|qrcode_key|api[-_]?key|authorization|mimo_api_key)([=:])[^\s,&;]+", r"\1\2<已脱敏>", text)
     return text
 
 
@@ -114,13 +123,15 @@ def disk_build_id() -> str:
 
 def configure_data_dir(data_dir: str | None) -> None:
     """测试可指定隔离目录，正常启动仍只使用当前用户的 AppData。"""
-    global APP_DATA, CONFIG_FILE, AUTH_FILE, QR_PACKAGE_DIR, LOG_DIR
+    global APP_DATA, CONFIG_FILE, AUTH_FILE, MIMO_AUTH_FILE, QR_PACKAGE_DIR, LOG_DIR, MIMO_API_KEY_CACHE
     if data_dir:
         APP_DATA = Path(data_dir).expanduser().resolve()
         CONFIG_FILE = APP_DATA / "config.json"
         AUTH_FILE = APP_DATA / "bilibili-auth.dat"
+        MIMO_AUTH_FILE = APP_DATA / "mimo-auth.dat"
         QR_PACKAGE_DIR = APP_DATA / "python-packages"
         LOG_DIR = APP_DATA / "logs"
+        MIMO_API_KEY_CACHE = None
         if "BILIBILI_SESSION" in globals():
             BILIBILI_SESSION.reset()
 
@@ -150,7 +161,7 @@ class _DataBlob(ctypes.Structure):
 
 def _dpapi(plain: bytes, protect: bool) -> bytes:
     if os.name != "nt":
-        raise RuntimeError("B 站登录凭据只能在 Windows 本机保存。")
+        raise RuntimeError("敏感凭据只能在 Windows 本机安全保存。")
     source = ctypes.create_string_buffer(plain)
     input_blob = _DataBlob(len(plain), ctypes.cast(source, ctypes.POINTER(ctypes.c_byte)))
     output_blob = _DataBlob()
@@ -163,6 +174,39 @@ def _dpapi(plain: bytes, protect: bool) -> bytes:
         return ctypes.string_at(output_blob.pbData, output_blob.cbData)
     finally:
         ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+
+
+MIMO_API_KEY_CACHE: str | None = None
+
+
+def load_mimo_api_key() -> str:
+    global MIMO_API_KEY_CACHE
+    if MIMO_API_KEY_CACHE is not None:
+        return MIMO_API_KEY_CACHE
+    try:
+        encoded = MIMO_AUTH_FILE.read_text(encoding="ascii")
+        plain = _dpapi(base64.b64decode(encoded), False).decode("utf-8")
+        payload = json.loads(plain)
+        key = str(payload.get("api_key") or "") if isinstance(payload, dict) else ""
+    except (FileNotFoundError, OSError, ValueError, UnicodeError, ctypes.ArgumentError, json.JSONDecodeError):
+        key = ""
+    MIMO_API_KEY_CACHE = key
+    return key
+
+
+def save_mimo_api_key(value: str) -> None:
+    global MIMO_API_KEY_CACHE
+    APP_DATA.mkdir(parents=True, exist_ok=True)
+    plain = json.dumps({"version": 1, "api_key": value}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    encrypted = _dpapi(plain, True)
+    temporary = MIMO_AUTH_FILE.with_suffix(".tmp")
+    temporary.write_text(base64.b64encode(encrypted).decode("ascii"), encoding="ascii")
+    temporary.replace(MIMO_AUTH_FILE)
+    MIMO_API_KEY_CACHE = value
+
+
+def mimo_key_hint(value: str) -> str:
+    return f"{value[:4]}…{value[-4:]}" if len(value) >= 9 else "已配置"
 
 
 DEVICE_COOKIE_NAMES = {"buvid3", "buvid4", "buvid_fp", "b_nut", "b_lsid", "_uuid", "buvid_fp_plain"}
@@ -492,6 +536,168 @@ class BBDownService:
 SERVICE = BBDownService()
 
 
+def transcription_provider_settings() -> tuple[str, dict]:
+    provider = str(read_config().get("transcription_provider") or "local")
+    if provider not in TRANSCRIPTION_PROVIDERS:
+        provider = "local"
+    return provider, TRANSCRIPTION_PROVIDERS[provider]
+
+
+def public_transcription_settings() -> dict:
+    provider, details = transcription_provider_settings()
+    key = load_mimo_api_key()
+    return {
+        "provider": provider,
+        "model": details["model"],
+        "label": details["label"],
+        "mimo_api_key_configured": bool(key),
+        "mimo_api_key_hint": mimo_key_hint(key) if key else "",
+    }
+
+
+def mimo_request(path: str, api_key: str, payload: dict | None = None, method: str = "POST") -> tuple[int, object]:
+    if not api_key:
+        raise RuntimeError("尚未配置 MiMo API Key。")
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if payload is not None else None
+    headers = {"api-key": api_key, "Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    retryable = {429, 500, 502, 503, 504}
+    last_error = "MiMo API 请求失败。"
+    for attempt in range(4):
+        request = urllib.request.Request(f"{MIMO_BASE_URL}{path}", body, method=method, headers=headers)
+        try:
+            with LOCAL_OPENER.open(request, timeout=120) as response:
+                raw = response.read()
+                try:
+                    return response.status, json.loads(raw.decode("utf-8")) if raw else {}
+                except json.JSONDecodeError:
+                    return response.status, {}
+        except urllib.error.HTTPError as error:
+            raw = error.read()
+            try:
+                result = json.loads(raw.decode("utf-8")) if raw else {}
+            except json.JSONDecodeError:
+                result = {}
+            last_error = asr_error_message(result, f"MiMo API 请求失败（HTTP {error.code}）。")
+            if error.code not in retryable or attempt == 3:
+                raise RuntimeError(last_error)
+        except urllib.error.URLError as error:
+            last_error = "MiMo API 网络请求失败，请检查网络连接。"
+            if attempt == 3:
+                raise RuntimeError(last_error) from error
+        time.sleep(0.8 * (2 ** attempt))
+    raise RuntimeError(last_error)
+
+
+def test_mimo_api_key(api_key: str, provider: str) -> None:
+    if provider not in {"mimo-v2.5-asr", "mimo-v2.6-flash"}:
+        return
+    status, payload = mimo_request("/models", api_key, method="GET")
+    if status < 200 or status >= 300:
+        raise RuntimeError(asr_error_message(payload, f"MiMo API 测试失败（HTTP {status}）。"))
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        ids = {str(item.get("id")) for item in payload["data"] if isinstance(item, dict)}
+        model = TRANSCRIPTION_PROVIDERS[provider]["model"]
+        if ids and model not in ids:
+            raise RuntimeError(f"当前 MiMo API Key 未返回模型 {model}。")
+
+
+def ffmpeg_executable() -> Path | None:
+    candidates = [TOOLS_DIR / "ffmpeg" / "bin" / "ffmpeg.exe", TOOLS_DIR / "ffmpeg" / "ffmpeg.exe"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    found = shutil.which("ffmpeg")
+    return Path(found) if found else None
+
+
+def mimo_audio_chunks(audio_path: Path, temp_dir: Path, provider: str) -> list[Path]:
+    executable = ffmpeg_executable()
+    if executable is None:
+        raise RuntimeError("缺少 FFmpeg，无法准备 MiMo 音频。")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    max_encoded_bytes = 9 * 1024 * 1024 if provider == "mimo-v2.5-asr" else 48 * 1024 * 1024
+    segment_seconds = 300 if provider == "mimo-v2.5-asr" else 600
+    for _ in range(5):
+        for old in temp_dir.glob("chunk-*.mp3"):
+            old.unlink(missing_ok=True)
+        output_pattern = str(temp_dir / "chunk-%05d.mp3")
+        command = [
+            str(executable), "-hide_banner", "-loglevel", "error", "-y", "-i", str(audio_path),
+            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k",
+            "-f", "segment", "-segment_time", str(segment_seconds), "-reset_timestamps", "1", output_pattern,
+        ]
+        result = subprocess.run(command, cwd=ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800, check=False)
+        if result.returncode != 0:
+            raise RuntimeError("FFmpeg 无法转换 MiMo 音频。")
+        chunks = sorted(temp_dir.glob("chunk-*.mp3"))
+        if chunks and all(((path.stat().st_size + 2) // 3) * 4 + 64 < max_encoded_bytes for path in chunks):
+            return chunks
+        segment_seconds //= 2
+    raise RuntimeError("音频切片后仍超过 MiMo 单次请求限制。")
+
+
+def mimo_response_text(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    message = choices[0].get("message") or {}
+    content = message.get("content") if isinstance(message, dict) else ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts).strip()
+    return ""
+
+
+def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model: str) -> dict:
+    api_key = load_mimo_api_key()
+    if not api_key:
+        raise RuntimeError("当前已选择 MiMo，但尚未配置 API Key。请到“设置”中保存并测试。")
+    chunks = mimo_audio_chunks(audio_path, temp_dir, provider)
+    texts = []
+    for index, chunk in enumerate(chunks, 1):
+        encoded = base64.b64encode(chunk.read_bytes()).decode("ascii")
+        mime = mimetypes.guess_type(chunk.name)[0] or "audio/mpeg"
+        audio_data = f"data:{mime};base64,{encoded}"
+        if provider == "mimo-v2.5-asr":
+            messages = [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": audio_data}}]}]
+            payload = {"model": model, "messages": messages, "asr_options": {"language": "zh"}}
+        else:
+            messages = [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": audio_data}}, {"type": "text", "text": "忠实转写音频原话，不总结、不润色、不补充内容。"}]}]
+            payload = {"model": model, "messages": messages, "max_completion_tokens": 4096}
+        try:
+            status, response = mimo_request("/chat/completions", api_key, payload)
+            if status < 200 or status >= 300:
+                raise RuntimeError(asr_error_message(response, f"MiMo 第 {index}/{len(chunks)} 个音频片段请求失败。"))
+            text = mimo_response_text(response)
+            if not text:
+                raise RuntimeError("MiMo 返回空文字稿。")
+            texts.append(text)
+        except Exception as error:
+            raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 个音频片段失败：{short_error(error)}") from error
+    return {
+        "api_version": "mimo-openai-compatible",
+        "task_id": "",
+        "status": "succeeded",
+        "progress": 100,
+        "filename": audio_path.name,
+        "text": "\n".join(texts),
+        "segments": [],
+        "timestamps": [],
+        "model": {"provider": "mimo", "model_id": model, "timestamps_supported": False},
+        "metrics": {"chunk_count": len(chunks)},
+        "error": None,
+    }
+
+
 TRANSCRIPTION_LOCK = threading.RLock()
 TRANSCRIPTION_TASKS: dict[str, dict] = {}
 ASR_SERVICE_HOST = "127.0.0.1"
@@ -508,7 +714,7 @@ def transcription_root() -> Path:
 def public_transcription(task: dict) -> dict:
     fields = (
         "task_id", "name", "source_url", "source_title", "status", "stage", "progress",
-        "error", "result", "filename", "created_at", "finished_at", "parent_id",
+        "error", "result", "filename", "created_at", "finished_at", "parent_id", "provider", "model",
     )
     return {key: task.get(key) for key in fields}
 
@@ -526,6 +732,7 @@ def new_transcription_task(source: dict, *, parent_id: str | None = None, filena
     task_id = secrets.token_hex(12)
     title = str(source.get("title") or "未命名视频")
     name = f"{title} · {filename}" if filename else title
+    provider, details = transcription_provider_settings()
     task = {
         "task_id": task_id,
         "name": name,
@@ -540,6 +747,8 @@ def new_transcription_task(source: dict, *, parent_id: str | None = None, filena
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "finished_at": "",
         "parent_id": parent_id,
+        "provider": provider,
+        "model": details["model"],
         "pages": [str(page) for page in source.get("pages", []) if str(page).isdigit()],
         "all_pages": bool(source.get("all_pages")),
         "audio_path": "",
@@ -641,7 +850,7 @@ def transcription_audio_files(directory: Path) -> list[Path]:
     )
 
 
-def run_transcription_audio(task_id: str, audio_path: Path) -> None:
+def run_local_transcription_audio(task_id: str, audio_path: Path) -> None:
     asr_task_id = ""
     try:
         with TRANSCRIPTION_LOCK:
@@ -680,6 +889,30 @@ def run_transcription_audio(task_id: str, audio_path: Path) -> None:
     finally:
         if asr_task_id:
             delete_asr_job(asr_task_id)
+
+
+def run_transcription_audio(task_id: str, audio_path: Path) -> None:
+    with TRANSCRIPTION_LOCK:
+        task = dict(TRANSCRIPTION_TASKS.get(task_id) or {})
+    provider = str(task.get("provider") or "local")
+    model = str(task.get("model") or TRANSCRIPTION_PROVIDERS["local"]["model"])
+    if provider == "local":
+        run_local_transcription_audio(task_id, audio_path)
+        return
+    try:
+        update_transcription(task_id, status="processing", stage="正在请求 MiMo", progress=40)
+        result = mimo_transcribe_audio(audio_path, audio_path.parent / "mimo", provider, model)
+        update_transcription(task_id, status="succeeded", stage="转写完成", progress=100, result=result, finished_at=datetime.now().isoformat(timespec="seconds"))
+    except Exception as error:
+        update_transcription(task_id, status="failed", stage="转写失败", progress=0, error=short_error(error), finished_at=datetime.now().isoformat(timespec="seconds"))
+
+
+def run_manual_transcription(task_id: str, audio_path: Path, temp_dir: Path) -> None:
+    try:
+        update_transcription(task_id, status="queued", stage="等待转写", progress=5, filename=audio_path.name)
+        run_transcription_audio(task_id, audio_path)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def run_transcription_pipeline(task_id: str, source: dict) -> None:
@@ -1343,6 +1576,40 @@ class Handler(SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
+    def handle_manual_transcription_upload(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length > 2 * 1024 * 1024 * 1024:
+            raise ValueError("音频文件超过 2 GB，暂不支持转写。")
+        content_type = self.headers.get("Content-Type", "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            raise ValueError("请选择要转写的本地音频文件。")
+        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type})
+        file_item = form["file"] if "file" in form else None
+        if file_item is None or not getattr(file_item, "filename", "") or not getattr(file_item, "file", None):
+            raise ValueError("请选择要转写的本地音频文件。")
+        filename = Path(str(file_item.filename)).name
+        if Path(filename).suffix.lower() not in {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".opus", ".aac"}:
+            raise ValueError("请选择 M4A、MP3、WAV、FLAC、OGG 或 AAC 音频文件。")
+        provider, _ = transcription_provider_settings()
+        if provider != "local" and not load_mimo_api_key():
+            raise ValueError("当前已选择 MiMo，但尚未配置 API Key。请到“设置”中保存并测试。")
+        source = {"url": "", "title": filename, "pages": [], "all_pages": True}
+        task = new_transcription_task(source)
+        temp_dir = transcription_root() / task["task_id"]
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = temp_dir / filename
+        try:
+            with audio_path.open("wb") as target:
+                while chunk := file_item.file.read(1024 * 1024):
+                    target.write(chunk)
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            with TRANSCRIPTION_LOCK:
+                TRANSCRIPTION_TASKS.pop(task["task_id"], None)
+            raise ValueError("无法保存本地音频文件。")
+        threading.Thread(target=run_manual_transcription, args=(task["task_id"], audio_path, temp_dir), daemon=True).start()
+        self.send_json({"item": public_transcription(task)}, HTTPStatus.ACCEPTED)
+
     def do_GET(self) -> None:
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
@@ -1386,6 +1653,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(body)
             elif path == "/api/config":
                 self.send_json(read_config())
+            elif path == "/api/transcription/settings":
+                self.send_json(public_transcription_settings())
             elif path == "/api/login/status":
                 with LOGIN_LOCK:
                     pending = bool(LOGIN_STATE.get("qrcode_key"))
@@ -1418,6 +1687,9 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         try:
+            if path == "/api/transcriptions/manual":
+                self.handle_manual_transcription_upload()
+                return
             data = self.read_json()
             if path == "/api/select-directory":
                 selected = select_folder()
@@ -1440,6 +1712,23 @@ class Handler(SimpleHTTPRequestHandler):
                 save_config(config)
                 ok, message = SERVICE.ensure_started(selected)
                 self.send_json({"download_dir": selected, "ready": ok, "error": message})
+            elif path == "/api/transcription/settings":
+                provider = str(data.get("provider") or "local")
+                if provider not in TRANSCRIPTION_PROVIDERS:
+                    raise ValueError("请选择有效的转写引擎。")
+                api_key = str(data.get("api_key") or "").strip()
+                if provider != "local":
+                    if api_key and not re.fullmatch(r"sk-[A-Za-z0-9._-]{6,}", api_key):
+                        raise ValueError("MiMo API Key 格式应为 sk- 开头。")
+                    api_key = api_key or load_mimo_api_key()
+                    if not api_key:
+                        raise ValueError("请填写 MiMo API Key。")
+                    test_mimo_api_key(api_key, provider)
+                    save_mimo_api_key(api_key)
+                config = read_config()
+                config["transcription_provider"] = provider
+                save_config(config)
+                self.send_json(public_transcription_settings())
             elif path == "/api/login/start":
                 self.send_json(start_login())
             elif path == "/api/login/poll":

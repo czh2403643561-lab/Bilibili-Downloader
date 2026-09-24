@@ -1,4 +1,4 @@
-const state = { video: null, online: false, stale: false, restarting: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, postsError: '', collectionsError: '', detail: null }, asr: { health: null, file: null, duration: null, job: null, result: null, tab: 'text', polling: null, tasks: [], activeTaskId: null } };
+const state = { video: null, online: false, stale: false, restarting: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), transcription: { provider: 'local', model: '', label: '', mimo_api_key_configured: false, mimo_api_key_hint: '' }, up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, postsError: '', collectionsError: '', detail: null }, asr: { health: null, file: null, duration: null, job: null, result: null, tab: 'text', polling: null, tasks: [], activeTaskId: null } };
 const $ = (selector) => document.querySelector(selector);
 const PLACEHOLDER_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="328" height="184" viewBox="0 0 328 184"><rect width="328" height="184" fill="#eef0f4"/><path d="M132 78h64v28h-64z" fill="#c5ccd7"/><circle cx="148" cy="88" r="5" fill="#eef0f4"/><path d="m139 101 15-14 10 9 11-12 14 17z" fill="#eef0f4"/><text x="164" y="132" text-anchor="middle" fill="#8d98a8" font-size="14">封面暂时无法加载</text></svg>')}`;
 let loginTimer = null;
@@ -10,6 +10,17 @@ async function api(path, options = {}) {
   const timeout = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try { response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, signal: controller.signal, ...fetchOptions }); }
   catch (_) { if (!state.directorySelecting) setOffline(); throw new Error('本地服务已断开，请重新启动工具。'); }
+  finally { if (timeout) clearTimeout(timeout); }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) { const error = new Error(data.error || '请求失败，请稍后重试。'); error.status = response.status; error.data = data; throw error; }
+  return data;
+}
+async function uploadApi(path, formData, timeoutMs = 0) {
+  let response;
+  const controller = new AbortController();
+  const timeout = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try { response = await fetch(path, { method: 'POST', body: formData, signal: controller.signal }); }
+  catch (_) { throw new Error('本地服务已断开，请重新启动工具。'); }
   finally { if (timeout) clearTimeout(timeout); }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) { const error = new Error(data.error || '请求失败，请稍后重试。'); error.status = response.status; error.data = data; throw error; }
@@ -277,6 +288,28 @@ async function startLogin() {
 }
 async function logout() { try { renderLoginStatus(await api('/api/login/logout', { method: 'POST', body: '{}' })); } catch (error) { $('#login-status').textContent = error.message; } }
 
+function renderTranscriptionSettings() {
+  const settings = state.transcription;
+  $('#transcription-provider').value = settings.provider || 'local';
+  const cloud = settings.provider !== 'local';
+  $('#mimo-key-row').classList.toggle('hidden', !cloud);
+  $('#mimo-key-status').textContent = settings.mimo_api_key_configured ? `已配置（${settings.mimo_api_key_hint}）` : '未配置';
+}
+async function refreshTranscriptionSettings() {
+  try { state.transcription = await api('/api/transcription/settings'); renderTranscriptionSettings(); await checkAsrHealth(); }
+  catch (error) { $('#transcription-settings-message').textContent = error.message; }
+}
+async function saveTranscriptionSettings() {
+  const button = $('#transcription-save'); const message = $('#transcription-settings-message');
+  button.disabled = true; message.textContent = '正在保存并测试…';
+  try {
+    const body = { provider: $('#transcription-provider').value, api_key: $('#mimo-api-key').value.trim() };
+    state.transcription = await api('/api/transcription/settings', { method: 'POST', timeoutMs: 30000, body: JSON.stringify(body) });
+    $('#mimo-api-key').value = ''; renderTranscriptionSettings(); message.textContent = '已保存并测试通过。'; await checkAsrHealth();
+  } catch (error) { message.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
 const ASR_EXTENSIONS = new Set(['m4a', 'mp3', 'wav', 'flac']);
 const ASR_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 const ASR_STATUS = { preparing: ['正在准备音频', '正在整理本地音频。'], uploading: ['正在上传', '正在发送至你的本机转写服务。'], queued: ['排队中', '等待本机转写服务处理。'], processing: ['正在转写', '正在由本机转写服务处理。'], succeeded: ['转写完成', '文字稿已准备完成。'], failed: ['转写失败', '本次转写没有完成。'], cancelled: ['已取消', '转写任务已取消。'] };
@@ -294,7 +327,8 @@ function renderAutomaticTasks() {
     const progress = Math.max(0, Math.min(100, Number(task.progress || 0)));
     const failed = ['failed', 'cancelled'].includes(task.status);
     const done = task.status === 'succeeded';
-    return `<article class="asr-task ${task.task_id === state.asr.activeTaskId ? 'active' : ''}" data-asr-task="${escapeHtml(task.task_id)}"><div class="task-top"><span class="task-name">${escapeHtml(task.name || task.source_title || '转写任务')}</span><span class="task-status ${failed ? 'failed' : done ? 'done' : ''}">${escapeHtml(AUTO_ASR_STATUS[task.status] || task.status || '等待中')}</span></div><div class="task-progress"><span style="width:${done ? 100 : progress}%"></span></div><div class="task-meta"><span>${escapeHtml(task.stage || '')}</span><span>进度：${done ? 100 : progress}%</span></div>${task.error ? `<div class="task-error">${escapeHtml(task.error)}</div>` : ''}</article>`;
+    const model = task.provider === 'local' ? '本地 FunASR' : task.model;
+    return `<article class="asr-task ${task.task_id === state.asr.activeTaskId ? 'active' : ''}" data-asr-task="${escapeHtml(task.task_id)}"><div class="task-top"><span class="task-name">${escapeHtml(task.name || task.source_title || '转写任务')}</span><span class="task-status ${failed ? 'failed' : done ? 'done' : ''}">${escapeHtml(AUTO_ASR_STATUS[task.status] || task.status || '等待中')}</span></div><div class="task-progress"><span style="width:${done ? 100 : progress}%"></span></div><div class="task-meta"><span>${escapeHtml(model || '')}</span><span>${escapeHtml(task.stage || '')}</span><span>进度：${done ? 100 : progress}%</span></div>${task.error ? `<div class="task-error">${escapeHtml(task.error)}</div>` : ''}</article>`;
   }).join('');
 }
 function renderAsr() {
@@ -316,13 +350,25 @@ function renderAsr() {
     if (hasRealProgress) { $('#asr-progress-fill').style.width = `${job.progress}%`; $('#asr-progress-text').textContent = `已完成 ${job.progress}%`; }
     document.querySelectorAll('[data-asr-step]').forEach((step) => { const order = ['preparing', 'uploading', 'queued', 'processing', 'succeeded']; const activeIndex = order.indexOf(key); const ownIndex = order.indexOf(step.dataset.asrStep); step.classList.toggle('active', ownIndex <= activeIndex && key !== 'failed' && key !== 'cancelled'); });
   } else { $('#asr-progress').classList.add('hidden'); $('#asr-progress-text').classList.add('hidden'); }
+  $('#asr-tab-timeline').disabled = false; $('#asr-timeline-note').classList.add('hidden');
   const result = currentAsrResult(); $('#asr-result').classList.toggle('hidden', !result); if (!result) return;
-  $('#asr-result-meta').textContent = automatic ? `本地转写结果 · ${automatic.name || automatic.filename || ''}` : (health?.mode === 'mock' ? '模拟模式结果 / 等待真实 ASR 服务' : '本地转写结果'); $('#asr-text').textContent = result.text;
-  const timeline = $('#asr-timeline'); timeline.innerHTML = (result.segments || []).map((segment) => `<article class="asr-segment"><time>${formatAsrTime(segment.start_ms)}</time><div>${segment.speaker ? `<strong>${escapeHtml(segment.speaker)}</strong>` : ''}<p>${escapeHtml(segment.text)}</p></div></article>`).join('');
+  const segments = result.segments || []; const hasTimeline = segments.length > 0 && segments.every(AsrClient.validSegment); if (!hasTimeline) asr.tab = 'text';
+  const modelLabel = automatic ? (automatic.provider === 'local' ? '本地 FunASR' : automatic.model) : (health?.mode === 'mock' ? '模拟模式' : '本地 FunASR');
+  $('#asr-result-meta').textContent = `${modelLabel} · ${automatic?.name || automatic?.filename || asrFileName()}`; $('#asr-text').textContent = result.text;
+  const timeline = $('#asr-timeline'); timeline.innerHTML = segments.map((segment) => `<article class="asr-segment"><time>${formatAsrTime(segment.start_ms)}</time><div>${segment.speaker ? `<strong>${escapeHtml(segment.speaker)}</strong>` : ''}<p>${escapeHtml(segment.text)}</p></div></article>`).join('');
+  $('#asr-tab-timeline').disabled = !hasTimeline; $('#asr-timeline-note').classList.toggle('hidden', hasTimeline); $('#asr-timeline-note').textContent = hasTimeline ? '' : '当前模型未提供精确时间戳，时间轴和 SRT/VTT 导出不可用。';
   $('#asr-tab-text').classList.toggle('active', asr.tab === 'text'); $('#asr-tab-timeline').classList.toggle('active', asr.tab === 'timeline'); $('#asr-text').classList.toggle('hidden', asr.tab !== 'text'); timeline.classList.toggle('hidden', asr.tab !== 'timeline');
-  const valid = (result.segments || []).length && result.segments.every(AsrClient.validSegment); $('#asr-export-srt').disabled = !valid; $('#asr-export-vtt').disabled = !valid;
+  const valid = hasTimeline; $('#asr-export-srt').disabled = !valid; $('#asr-export-vtt').disabled = !valid;
 }
-async function checkAsrHealth() { try { state.asr.health = await AsrClient.checkHealth(); } catch (_) { state.asr.health = { mode: 'offline', available: false, message: '本地转写服务未启动' }; } renderAsr(); }
+async function checkAsrHealth() {
+  if (state.transcription.provider === 'local') {
+    try { state.asr.health = await AsrClient.checkHealth(); } catch (_) { state.asr.health = { mode: 'offline', available: false, message: '本地转写服务未启动' }; }
+  } else {
+    const configured = Boolean(state.transcription.mimo_api_key_configured);
+    state.asr.health = { mode: 'mimo', available: configured, message: configured ? `MiMo 已配置：${state.transcription.model}` : 'MiMo API Key 未配置' };
+  }
+  renderAsr();
+}
 async function refreshTranscriptionTasks() {
   try {
     const result = await api('/api/transcriptions');
@@ -341,7 +387,16 @@ async function setAsrFile(file) {
 }
 function stopAsrPolling() { if (state.asr.polling) clearInterval(state.asr.polling); state.asr.polling = null; }
 async function pollAsrJob() { const job = state.asr.job; if (!job) return; try { state.asr.job = await AsrClient.getJob(job.task_id); if (state.asr.job.status === 'succeeded') { state.asr.result = await AsrClient.getJobResult(job.task_id); stopAsrPolling(); } if (['failed', 'cancelled'].includes(state.asr.job.status)) stopAsrPolling(); } catch (error) { state.asr.job = { ...job, status: 'failed', error: error.message }; stopAsrPolling(); asrMessage('转写服务暂时不可用。'); } renderAsr(); }
-async function startAsr() { if (!state.asr.file) { asrMessage('请先选择本地音频文件。'); return; } asrMessage(''); state.asr.activeTaskId = null; try { state.asr.job = await AsrClient.createTranscriptionJob({ type: 'local_file', file: state.asr.file }); state.asr.result = null; renderAsr(); stopAsrPolling(); state.asr.polling = setInterval(pollAsrJob, 1000); await pollAsrJob(); } catch (error) { asrMessage(error.message); renderAsr(); } }
+async function startAsr() {
+  if (!state.asr.file) { asrMessage('请先选择本地音频文件。'); return; }
+  asrMessage('');
+  try {
+    const form = new FormData(); form.append('file', state.asr.file, state.asr.file.name);
+    const result = await uploadApi('/api/transcriptions/manual', form);
+    state.asr.job = null; state.asr.result = null; state.asr.activeTaskId = result.item?.task_id || null;
+    renderAsr(); await refreshTranscriptionTasks();
+  } catch (error) { asrMessage(error.message); renderAsr(); }
+}
 async function cancelAsr() { if (!state.asr.job) return; try { state.asr.job = await AsrClient.cancelJob(state.asr.job.task_id); stopAsrPolling(); } catch (error) { if (error.status === 409) asrMessage('任务已开始转写，当前不能中断。'); else asrMessage(error.message); } renderAsr(); }
 async function copyAsrText() { try { await navigator.clipboard.writeText(currentAsrResult()?.text || ''); asrMessage('全文已复制。'); } catch (_) { asrMessage('无法自动复制，请手动选择文字稿。'); } }
 function exportAsr(kind) { try { const result = currentAsrResult(); const text = AsrClient.exportText(result, kind); const blob = new Blob([text], { type: 'text/plain;charset=utf-8' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `${activeAutomaticTask()?.name || asrFileName()}.${kind}`.replace(/[\\/:*?"<>|]/g, '_'); link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 0); } catch (error) { asrMessage(error.message); } }
@@ -367,7 +422,8 @@ function bindEvents() {
   $('#up-detail-clear-page').addEventListener('click', () => { (state.up.detail?.items || []).forEach((item) => delete state.up.selected[item.bvid]); renderUp(); });
   $('#up-clear-selected-detail').addEventListener('click', clearUpSelected);
   $('#asr-task-list').addEventListener('click', (event) => { const task = event.target.closest('[data-asr-task]'); if (!task) return; state.asr.activeTaskId = task.dataset.asrTask; state.asr.tab = 'text'; renderAsr(); });
+  $('#transcription-provider').addEventListener('change', () => { $('#mimo-key-row').classList.toggle('hidden', $('#transcription-provider').value === 'local'); }); $('#transcription-save').addEventListener('click', saveTranscriptionSettings);
   $('#asr-file').addEventListener('change', (event) => setAsrFile(event.target.files?.[0])); $('#asr-new-file').addEventListener('click', () => $('#asr-file').click()); $('#asr-start').addEventListener('click', startAsr); $('#asr-cancel').addEventListener('click', cancelAsr);
   $('#asr-tab-text').addEventListener('click', () => { state.asr.tab = 'text'; renderAsr(); }); $('#asr-tab-timeline').addEventListener('click', () => { state.asr.tab = 'timeline'; renderAsr(); }); $('#asr-copy').addEventListener('click', copyAsrText); $('#asr-export-txt').addEventListener('click', () => exportAsr('txt')); $('#asr-export-srt').addEventListener('click', () => exportAsr('srt')); $('#asr-export-vtt').addEventListener('click', () => exportAsr('vtt'));
 }
-setupNavigation(); bindEvents(); renderAsr(); refreshHealth(); refreshLoginStatus(); checkAsrHealth(); refreshTranscriptionTasks(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000); setInterval(refreshTranscriptionTasks, 1000);
+setupNavigation(); bindEvents(); renderAsr(); renderTranscriptionSettings(); refreshHealth(); refreshLoginStatus(); checkAsrHealth(); refreshTranscriptionSettings(); refreshTranscriptionTasks(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000); setInterval(refreshTranscriptionTasks, 1000);
