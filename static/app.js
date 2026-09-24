@@ -1,4 +1,4 @@
-const state = { video: null, online: false, stale: false, restarting: false, directorySelecting: false, meeting: { connected: false, taskId: null }, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), transcription: { provider: 'local', model: '', label: '', mimo_api_key_configured: false, mimo_api_key_hint: '' }, up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, postsError: '', collectionsError: '', detail: null }, asr: { health: null, file: null, duration: null, job: null, result: null, polling: null, tasks: [], activeTaskId: null, manageMode: false, selectedTaskIds: [] } };
+const state = { video: null, online: false, stale: false, restarting: false, directorySelecting: false, loginQrFailed: false, meeting: { connected: false, taskId: null }, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), transcription: { provider: 'local', model: '', label: '', mimo_api_key_configured: false, mimo_api_key_hint: '' }, up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, postsError: '', collectionsError: '', detail: null }, asr: { health: null, file: null, duration: null, job: null, result: null, polling: null, tasks: [], activeTaskId: null, manageMode: false, selectedTaskIds: [] } };
 const $ = (selector) => document.querySelector(selector);
 const PLACEHOLDER_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="328" height="184" viewBox="0 0 328 184"><rect width="328" height="184" fill="#eef0f4"/><path d="M132 78h64v28h-64z" fill="#c5ccd7"/><circle cx="148" cy="88" r="5" fill="#eef0f4"/><path d="m139 101 15-14 10 9 11-12 14 17z" fill="#eef0f4"/><text x="164" y="132" text-anchor="middle" fill="#8d98a8" font-size="14">封面暂时无法加载</text></svg>')}`;
 let loginTimer = null;
@@ -333,14 +333,14 @@ async function chooseDirectory() {
 async function simpleAction(path) { try { await api(path, { method: 'POST', body: '{}' }); } catch (error) { alert(error.message); } }
 
 function renderLoginStatus(result) {
-  $('#login-status').textContent = result.name ? `${result.status}：${result.name}` : (result.status || '未登录');
+  $('#login-status').textContent = state.loginQrFailed && !result.logged_in ? '二维码加载失败，请点击“重新生成二维码”重试。' : (result.name ? `${result.status}：${result.name}` : (result.status || '未登录'));
   $('#login-start').classList.toggle('hidden', Boolean(result.logged_in));
   $('#login-logout').classList.toggle('hidden', !result.logged_in);
   $('#login-qr-panel').classList.toggle('hidden', Boolean(result.logged_in) || !$('#login-qr').src);
 }
 async function refreshLoginStatus() { try { renderLoginStatus(await api('/api/login/status')); } catch (error) { $('#login-status').textContent = error.message; } }
 async function startLogin() {
-  const button = $('#login-start'); button.disabled = true;
+  const button = $('#login-start'); button.disabled = true; button.textContent = '正在准备二维码…'; state.loginQrFailed = false; $('#login-qr').removeAttribute('src'); $('#login-qr-panel').classList.add('hidden');
   try {
     const result = await api('/api/login/start', { method: 'POST', body: '{}' });
     $('#login-qr').src = result.qr_image;
@@ -349,7 +349,7 @@ async function startLogin() {
     if (loginTimer) clearInterval(loginTimer);
     loginTimer = setInterval(async () => { try { const status = await api('/api/login/poll', { method: 'POST', body: '{}' }); renderLoginStatus(status); if (status.logged_in || status.status === '二维码已过期') { clearInterval(loginTimer); loginTimer = null; } } catch (error) { $('#login-status').textContent = error.message; } }, 2000);
   } catch (error) { $('#login-status').textContent = error.message; }
-  finally { button.disabled = false; }
+  finally { button.disabled = false; if (button.textContent === '正在准备二维码…') button.textContent = '扫码登录'; }
 }
 async function logout() { try { renderLoginStatus(await api('/api/login/logout', { method: 'POST', body: '{}' })); } catch (error) { $('#login-status').textContent = error.message; } }
 
@@ -550,6 +550,7 @@ function bindEvents() {
   $('#download-button').addEventListener('click', createTask); $('#choose-first-dir').addEventListener('click', chooseDirectory); $('#choose-dir').addEventListener('click', chooseDirectory);
   $('#open-download-dir').addEventListener('click', () => simpleAction('/api/open-download-directory')); $('#open-logs').addEventListener('click', () => simpleAction('/api/open-log-directory')); $('#export-logs').addEventListener('click', () => simpleAction('/api/export-logs'));
   $('#login-start').addEventListener('click', startLogin); $('#login-logout').addEventListener('click', logout);
+  $('#login-qr').addEventListener('error', () => { state.loginQrFailed = true; $('#login-status').textContent = '二维码加载失败，请点击“重新生成二维码”重试。'; $('#login-start').textContent = '重新生成二维码'; });
   $('#meeting-bridge-check').addEventListener('click', refreshMeetingStatus);
   $('#meeting-parse').addEventListener('click', parseMeetingRecording); $('#meeting-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseMeetingRecording(); });
   $('#task-list').addEventListener('click', (event) => { const target = event.target; if (target.dataset.stop) stopTask(target.dataset.stop); if (target.dataset.retry) retryTask(target.dataset.retry); });

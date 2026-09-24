@@ -1,20 +1,19 @@
 # Project Status
 
-# CourseFlow ↔ Meeting Bridge
+## 当前成果
 
-## 已完成
-
-- 修复配对对 `Origin` 的单点依赖：固定扩展 ID + 当前 CourseFlow 进程随机 token 双重校验；`Origin` 缺失可用，存在时必须匹配该 Chrome/Edge 扩展，普通网页来源拒绝。
-- MV3 扩展把非敏感诊断状态保存在 `chrome.storage.session`，区分服务不可达、CORS/配对失败、鉴权失败、心跳失败和后台未启动；popup 提供重新连接、打开 CourseFlow 与折叠诊断信息。
-- 心跳由 `chrome.alarms` 驱动，并在扩展启动/安装时重新调度；popup 关闭不影响后台桥接。设置页提示插件内重新连接；“检查插件”只查询当前服务状态。
-- 未修改回放解析、媒体捕获、下载、音频或转写逻辑。
+- CourseFlow 提供 B 站公开视频解析与下载、UP 主投稿批量浏览、本地或 MiMo 转写，以及腾讯会议回放解析桥接。
+- B 站扫码二维码故障已修复：运行日志显示 `qrcode` 未安装时接口返回 500；pip 的 SOCKS 代理缺少支持时返回 400；依赖安装后还需刷新 Python 导入缓存。二维码依赖现与腾讯会议 Playwright 隔离，并在扫码接口响应前验证生成成功。
+- 二维码图片接口不再把 B 站登录 URL 放进查询参数；每次生成使用独立缓存标记，图片失败会提示重新生成。扫码轮询逻辑保持不变。
+- 腾讯会议桥接目前暂停，本轮未修改腾讯会议代码。
 
 ## 验证
 
-- Python 桥接单元与本机 HTTP 路由测试：18 项通过，含无 Origin 配对/心跳、错误 ID/token、恶意 Origin、CORS 预检及 token 不入日志。
-- 扩展 Node 测试：18 项通过，含配对/网络/CORS/鉴权诊断、自动重新配对、手动重连、alarm/startup/install 调度和 popup 状态。
-- 等待用户在 Chrome/Edge 重载扩展并点击“重新连接”验证真实服务 worker 通信；本轮没有测试腾讯会议回放或媒体。
+- `python -m py_compile app.py`、`node --check static/app.js`、`git diff --check` 通过。
+- `python -m unittest discover -s tests -v`：39 项通过，含假数据的扫码生成、二维码接口、失败提示和轮询测试；未调用真实 B 站扫码接口。
+- 使用隔离临时目录安装二维码依赖并实际生成 SVG 成功；B 站页面、UP 主批量页和转写中心可打开。
+- 尚待用户重启工具后进行真实 B 站扫码验收。
 
 ## 下一步
 
-- 启动 CourseFlow，在 `chrome://extensions` 重载 CourseFlow Bridge，打开插件并点“重新连接”；确认 popup 与设置页显示已连接。关闭 popup 等待 60 秒，再打开检查连接仍正常。
+- 重启 CourseFlow，在“设置 → B站账号”点击扫码登录；确认二维码显示，扫码后状态正常更新。

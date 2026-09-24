@@ -9,6 +9,7 @@ import ctypes
 import http.client
 from ctypes import wintypes
 import html
+import importlib
 import json
 import hashlib
 import logging
@@ -47,7 +48,7 @@ APP_DATA = Path(os.environ.get("BILIBILI_DOWNLOADER_DATA_DIR", DEFAULT_APP_DATA)
 CONFIG_FILE = APP_DATA / "config.json"
 AUTH_FILE = APP_DATA / "bilibili-auth.dat"
 MIMO_AUTH_FILE = APP_DATA / "mimo-auth.dat"
-QR_PACKAGE_DIR = APP_DATA / "python-packages"
+QR_PACKAGE_DIR = APP_DATA / "qr-packages"
 LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -133,7 +134,7 @@ def configure_data_dir(data_dir: str | None) -> None:
         CONFIG_FILE = APP_DATA / "config.json"
         AUTH_FILE = APP_DATA / "bilibili-auth.dat"
         MIMO_AUTH_FILE = APP_DATA / "mimo-auth.dat"
-        QR_PACKAGE_DIR = APP_DATA / "python-packages"
+        QR_PACKAGE_DIR = APP_DATA / "qr-packages"
         LOG_DIR = APP_DATA / "logs"
         MIMO_API_KEY_CACHE = None
         if "BILIBILI_SESSION" in globals():
@@ -1651,6 +1652,8 @@ def login_status_text(code: int) -> str:
 
 
 def start_login() -> dict:
+    with LOGIN_LOCK:
+        LOGIN_STATE.clear()
     anonymous_cookie()
     status, payload, set_cookies = login_request(BILIBILI_QR_GENERATE)
     BILIBILI_SESSION.merge_set_cookies(set_cookies)
@@ -1658,10 +1661,16 @@ def start_login() -> dict:
     data = payload.get("data") or {}
     if status != 200 or payload.get("code") != 0 or not data.get("url") or not data.get("qrcode_key"):
         raise ValueError("申请 B 站登录二维码失败，请稍后重试。")
+    qr_url = str(data["url"])
+    try:
+        qr_svg(qr_url)
+    except Exception as error:
+        LOG.warning("二维码生成失败（错误类型=%s）", type(error).__name__)
+        raise ValueError("二维码组件准备失败，请重启工具后重试。") from error
     with LOGIN_LOCK:
-        LOGIN_STATE.clear()
-        LOGIN_STATE.update({"qrcode_key": str(data["qrcode_key"]), "status": "等待扫码", "expires_at": time.time() + 180, "qr_url": str(data["url"])})
-    return {"status": "等待扫码", "expires_at": LOGIN_STATE["expires_at"], "qr_url": str(data["url"]), "qr_image": "/api/login/qr.svg?url=" + urllib.parse.quote(str(data["url"]), safe=""), "qrcode_key": str(data["qrcode_key"])}
+        LOGIN_STATE.update({"qrcode_key": str(data["qrcode_key"]), "status": "等待扫码", "expires_at": time.time() + 180, "qr_url": qr_url})
+        expires_at = LOGIN_STATE["expires_at"]
+    return {"status": "等待扫码", "expires_at": expires_at, "qr_url": qr_url, "qr_image": f"/api/login/qr.svg?v={secrets.token_hex(8)}"}
 
 
 def poll_login() -> dict:
@@ -1718,27 +1727,47 @@ def account_status() -> dict:
 def qr_module():
     if str(QR_PACKAGE_DIR) not in sys.path:
         sys.path.insert(0, str(QR_PACKAGE_DIR))
-    try:
+
+    def load_qrcode():
         import qrcode
+        import qrcode.constants
+        if not callable(getattr(qrcode, "QRCode", None)) or not hasattr(qrcode.constants, "ERROR_CORRECT_M"):
+            raise ImportError("二维码模块缺少必要组件")
+        module_path = getattr(qrcode, "__file__", None)
+        shared_packages = (APP_DATA / "python-packages").resolve()
+        if module_path and Path(module_path).resolve().is_relative_to(shared_packages):
+            raise ImportError("二维码模块位于共享依赖目录")
         return qrcode
-    except ImportError:
-        QR_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        return load_qrcode()
+    except (ImportError, AttributeError):
+        for name in tuple(sys.modules):
+            if name == "qrcode" or name.startswith("qrcode."):
+                sys.modules.pop(name, None)
         python = Path(sys.executable)
         pip_env = os.environ.copy()
         for proxy_name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
             pip_env.pop(proxy_name, None)
-        result = subprocess.run([
-            str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location",
-            "--target", str(QR_PACKAGE_DIR), "qrcode",
-        ], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=pip_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", timeout=45, check=False)
-        if result.returncode != 0:
-            LOG.warning("二维码组件准备失败：%s", result.stdout[-500:])
-            raise ValueError("二维码组件准备失败，请检查网络后重试。")
+        pip_env["NO_PROXY"] = "*"
+        pip_env["no_proxy"] = "*"
         try:
-            import qrcode
-            return qrcode
-        except ImportError as error:
-            raise ValueError("二维码组件准备失败，请重新启动工具后重试。") from error
+            QR_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run([
+                str(python), "-m", "pip", "--isolated", "install", "--disable-pip-version-check", "--no-warn-script-location",
+                "--target", str(QR_PACKAGE_DIR), "qrcode==8.2",
+            ], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=pip_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", timeout=45, check=False)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            LOG.warning("二维码组件准备失败（错误类型=%s）", type(error).__name__)
+            raise ValueError("二维码组件准备失败，请重启工具后重试。") from error
+        if result.returncode != 0:
+            LOG.warning("二维码组件安装失败（pip 退出码=%s）", result.returncode)
+            raise ValueError("二维码组件准备失败，请重启工具后重试。")
+        importlib.invalidate_caches()
+        try:
+            return load_qrcode()
+        except (ImportError, AttributeError) as error:
+            raise ValueError("二维码组件准备失败，请重启工具后重试。") from error
 
 
 def qr_svg(value: str) -> bytes:
@@ -2311,10 +2340,9 @@ class Handler(SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             elif path == "/api/login/qr.svg":
-                value = urllib.parse.parse_qs(parsed_url.query).get("url", [""])[0]
                 with LOGIN_LOCK:
-                    expected = str(LOGIN_STATE.get("qr_url") or "")
-                if not value or value != expected:
+                    value = str(LOGIN_STATE.get("qr_url") or "")
+                if not value:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
                 body = qr_svg(value)
