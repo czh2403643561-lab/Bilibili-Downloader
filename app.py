@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import http.client
 from ctypes import wintypes
 import html
 import json
@@ -380,6 +381,7 @@ class BBDownService:
         self.download_dir = ""
         self.port = 0
         self.lock = threading.Lock()
+        self.respect_config = True
 
     @staticmethod
     def pick_port() -> int:
@@ -422,14 +424,15 @@ class BBDownService:
                 self.process.kill()
         self.process = None
 
-    def ensure_started(self, download_dir: str) -> tuple[bool, str]:
+    def ensure_started(self, download_dir: str, respect_config: bool = True) -> tuple[bool, str]:
         problem = self.dependency_problem()
         if problem:
             return False, problem
         # 配置切换和前端轮询可能并发到达；以磁盘中的最新配置为准，避免旧轮询把服务切回旧目录。
-        configured_dir = read_config().get("download_dir", "")
-        if configured_dir:
-            download_dir = configured_dir
+        if respect_config:
+            configured_dir = read_config().get("download_dir", "")
+            if configured_dir:
+                download_dir = configured_dir
         with self.lock:
             if self.process and self.process.poll() is None and self.download_dir == download_dir:
                 return True, ""
@@ -466,7 +469,7 @@ class BBDownService:
     def request(self, path: str, method: str = "GET", data: dict | None = None) -> tuple[int, object]:
         if not self.download_dir:
             raise RuntimeError("请先选择下载目录。")
-        ok, message = self.ensure_started(self.download_dir)
+        ok, message = self.ensure_started(self.download_dir, respect_config=self.respect_config)
         if not ok:
             raise RuntimeError(message)
         payload = None if data is None else json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -487,6 +490,261 @@ class BBDownService:
 
 
 SERVICE = BBDownService()
+
+
+TRANSCRIPTION_LOCK = threading.RLock()
+TRANSCRIPTION_TASKS: dict[str, dict] = {}
+ASR_SERVICE_HOST = "127.0.0.1"
+ASR_SERVICE_PORT = 8765
+TRANSCRIPTION_AUDIO_SUFFIXES = {".m4a", ".mka", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".opus"}
+
+
+def transcription_root() -> Path:
+    root = APP_DATA / "transcription-temp"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def public_transcription(task: dict) -> dict:
+    fields = (
+        "task_id", "name", "source_url", "source_title", "status", "stage", "progress",
+        "error", "result", "filename", "created_at", "finished_at", "parent_id",
+    )
+    return {key: task.get(key) for key in fields}
+
+
+def update_transcription(task_id: str, **fields: object) -> dict | None:
+    with TRANSCRIPTION_LOCK:
+        task = TRANSCRIPTION_TASKS.get(task_id)
+        if task is None:
+            return None
+        task.update(fields)
+        return dict(task)
+
+
+def new_transcription_task(source: dict, *, parent_id: str | None = None, filename: str = "") -> dict:
+    task_id = secrets.token_hex(12)
+    title = str(source.get("title") or "未命名视频")
+    name = f"{title} · {filename}" if filename else title
+    task = {
+        "task_id": task_id,
+        "name": name,
+        "source_url": str(source.get("url") or ""),
+        "source_title": title,
+        "status": "queued",
+        "stage": "等待开始",
+        "progress": 0,
+        "error": "",
+        "result": None,
+        "filename": filename,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "finished_at": "",
+        "parent_id": parent_id,
+        "pages": [str(page) for page in source.get("pages", []) if str(page).isdigit()],
+        "all_pages": bool(source.get("all_pages")),
+        "audio_path": "",
+        "asr_task_id": "",
+        "download_task_id": "",
+    }
+    with TRANSCRIPTION_LOCK:
+        TRANSCRIPTION_TASKS[task_id] = task
+    return task
+
+
+def asr_error_message(payload: object, fallback: str) -> str:
+    if isinstance(payload, dict):
+        detail = payload.get("detail") or payload.get("error")
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("error") or detail.get("detail")
+        if detail:
+            return short_error(detail)
+    return fallback
+
+
+def asr_json(path: str, method: str = "GET", data: dict | None = None) -> tuple[int, object]:
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else None
+    request = urllib.request.Request(
+        f"http://{ASR_SERVICE_HOST}:{ASR_SERVICE_PORT}{path}",
+        body,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with LOCAL_OPENER.open(request, timeout=15) as response:
+            raw = response.read()
+            try:
+                return response.status, json.loads(raw.decode("utf-8")) if raw else {}
+            except json.JSONDecodeError:
+                return response.status, {}
+    except urllib.error.HTTPError as error:
+        raw = error.read()
+        try:
+            return error.code, json.loads(raw.decode("utf-8")) if raw else {}
+        except json.JSONDecodeError:
+            return error.code, {}
+    except urllib.error.URLError as error:
+        raise RuntimeError("本地转写服务未启动。") from error
+
+
+def asr_upload(audio_path: Path) -> dict:
+    boundary = f"----BilibiliDownloader{secrets.token_hex(12)}"
+    filename = audio_path.name.replace("\\", "_").replace('"', "_")
+    preamble = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8")
+    epilogue = f"\r\n--{boundary}--\r\n".encode("ascii")
+    connection = http.client.HTTPConnection(ASR_SERVICE_HOST, ASR_SERVICE_PORT, timeout=120)
+    try:
+        content_length = len(preamble) + audio_path.stat().st_size + len(epilogue)
+        connection.putrequest("POST", "/v1/jobs")
+        connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        connection.putheader("Content-Length", str(content_length))
+        connection.putheader("Connection", "close")
+        connection.endheaders()
+        connection.send(preamble)
+        with audio_path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                connection.send(chunk)
+        connection.send(epilogue)
+        response = connection.getresponse()
+        raw = response.read()
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except json.JSONDecodeError:
+            payload = {}
+        if response.status != HTTPStatus.ACCEPTED:
+            raise RuntimeError(asr_error_message(payload, f"转写服务提交失败（HTTP {response.status}）。"))
+        if not isinstance(payload, dict) or not payload.get("task_id"):
+            raise RuntimeError("转写服务提交失败：返回的任务信息不完整。")
+        return payload
+    except OSError as error:
+        raise RuntimeError("转写服务提交失败：无法读取或发送音频文件。") from error
+    finally:
+        connection.close()
+
+
+def delete_asr_job(task_id: str) -> None:
+    try:
+        status, payload = asr_json(f"/v1/jobs/{urllib.parse.quote(task_id, safe='')}", "DELETE")
+        if status not in {HTTPStatus.NO_CONTENT, HTTPStatus.OK}:
+            LOG.warning("清理转写服务任务失败 status=%s error=%s", status, asr_error_message(payload, "未知错误"))
+    except Exception as error:
+        LOG.warning("清理转写服务任务失败：%s", redact(error))
+
+
+def transcription_audio_files(directory: Path) -> list[Path]:
+    return sorted(
+        (path for path in directory.rglob("*") if path.is_file() and path.suffix.lower() in TRANSCRIPTION_AUDIO_SUFFIXES),
+        key=lambda path: str(path).casefold(),
+    )
+
+
+def run_transcription_audio(task_id: str, audio_path: Path) -> None:
+    asr_task_id = ""
+    try:
+        with TRANSCRIPTION_LOCK:
+            source_title = str(TRANSCRIPTION_TASKS.get(task_id, {}).get("source_title") or "未命名视频")
+        update_transcription(task_id, status="uploading", stage="提交本地转写服务", progress=40, filename=audio_path.name, name=f"{source_title} · {audio_path.name}")
+        status, health = asr_json("/health")
+        if status != HTTPStatus.OK or not isinstance(health, dict) or health.get("ready") is not True:
+            raise RuntimeError(asr_error_message(health, "本地转写服务未就绪。"))
+        payload = asr_upload(audio_path)
+        asr_task_id = str(payload["task_id"])
+        update_transcription(task_id, asr_task_id=asr_task_id, status="queued", stage="排队中", progress=45)
+        while True:
+            status, current = asr_json(f"/v1/jobs/{urllib.parse.quote(asr_task_id, safe='')}")
+            if status != HTTPStatus.OK or not isinstance(current, dict):
+                raise RuntimeError(asr_error_message(current, "无法读取本地转写任务状态。"))
+            current_status = str(current.get("status") or "")
+            raw_progress = current.get("progress")
+            service_progress = max(0, min(100, int(float(raw_progress)))) if isinstance(raw_progress, (int, float)) else 0
+            if current_status == "queued":
+                update_transcription(task_id, status="queued", stage="排队中", progress=max(45, min(55, 45 + service_progress // 10)))
+            elif current_status == "processing":
+                update_transcription(task_id, status="processing", stage="正在转写", progress=45 + round(service_progress * 0.55))
+            elif current_status == "succeeded":
+                result_status, result = asr_json(f"/v1/jobs/{urllib.parse.quote(asr_task_id, safe='')}/result")
+                if result_status != HTTPStatus.OK or not isinstance(result, dict):
+                    raise RuntimeError(asr_error_message(result, "文字稿结果读取失败。"))
+                update_transcription(task_id, status="succeeded", stage="转写完成", progress=100, result=result, finished_at=datetime.now().isoformat(timespec="seconds"))
+                return
+            elif current_status in {"failed", "cancelled"}:
+                raise RuntimeError(asr_error_message(current, "本地转写服务未完成任务。"))
+            else:
+                raise RuntimeError(f"本地转写服务返回未知状态：{current_status or '空'}")
+            time.sleep(1)
+    except Exception as error:
+        update_transcription(task_id, status="failed", stage="转写失败", progress=0, error=short_error(error), finished_at=datetime.now().isoformat(timespec="seconds"))
+    finally:
+        if asr_task_id:
+            delete_asr_job(asr_task_id)
+
+
+def run_transcription_pipeline(task_id: str, source: dict) -> None:
+    temp_dir = transcription_root() / task_id
+    service = BBDownService()
+    service.respect_config = False
+    try:
+        update_transcription(task_id, status="downloading", stage="正在获取音频", progress=5)
+        status, health = asr_json("/health")
+        if status != HTTPStatus.OK or not isinstance(health, dict) or health.get("ready") is not True:
+            raise RuntimeError(asr_error_message(health, "本地转写服务未就绪，无法开始自动转写。"))
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        ok, message = service.ensure_started(str(temp_dir), respect_config=False)
+        if not ok:
+            raise RuntimeError(message)
+        request_data = {
+            "url": source["url"],
+            "pages": ",".join(source.get("pages") or []) if source.get("pages") else "all",
+            "content": "a",
+            "mux": "mpeg4",
+            "dfnPriority": "1080P 高码率,1080P60,1080P+,1080P",
+            "maxRetry": 3,
+        }
+        status, result = service.request("/api/v1/tasks", "POST", request_data)
+        if status >= 300 or not isinstance(result, dict) or not result.get("id"):
+            raise RuntimeError(short_error(result.get("error") if isinstance(result, dict) else result or "音频下载任务提交失败。"))
+        download_task_id = str(result["id"])
+        update_transcription(task_id, download_task_id=download_task_id)
+        while True:
+            status, current = service.request(f"/api/v1/tasks/{urllib.parse.quote(download_task_id, safe='')}")
+            if status >= 300 or not isinstance(current, dict):
+                raise RuntimeError("无法读取音频下载任务状态。")
+            raw_progress = current.get("progress")
+            progress = max(0, min(100, int(float(raw_progress) * 100))) if isinstance(raw_progress, (int, float)) else 0
+            update_transcription(task_id, progress=max(5, round(progress * 0.35)), stage="正在获取音频")
+            current_status = str(current.get("status") or "")
+            if current_status == "Finished":
+                if current.get("isCancelled") or not current.get("isSuccessful"):
+                    raise RuntimeError(short_error(current.get("errorMessage") or "音频下载失败。"))
+                break
+            if current.get("isCancelled"):
+                raise RuntimeError("音频下载已取消。")
+            time.sleep(1)
+        audio_files = transcription_audio_files(temp_dir)
+        if not audio_files:
+            raise RuntimeError("音频下载完成但未找到音频文件。")
+        for index, audio_path in enumerate(audio_files):
+            if index == 0:
+                target_id = task_id
+            else:
+                child = new_transcription_task(source, parent_id=task_id, filename=audio_path.name)
+                target_id = child["task_id"]
+            update_transcription(target_id, name=f"{source.get('title') or '未命名视频'} · {audio_path.name}", filename=audio_path.name, audio_path=str(audio_path))
+            run_transcription_audio(target_id, audio_path)
+    except Exception as error:
+        update_transcription(task_id, status="failed", stage="转写失败", progress=0, error=short_error(error), finished_at=datetime.now().isoformat(timespec="seconds"))
+    finally:
+        service.stop()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def start_transcription(source: dict) -> dict:
+    task = new_transcription_task(source)
+    threading.Thread(target=run_transcription_pipeline, args=(task["task_id"], source), daemon=True).start()
+    return public_transcription(task)
 
 
 def schedule_restart() -> bool:
@@ -1144,6 +1402,11 @@ class Handler(SimpleHTTPRequestHandler):
                 else:
                     _, result = SERVICE.request("/api/v1/tasks")
                     self.send_json(result)
+            elif path == "/api/transcriptions":
+                with TRANSCRIPTION_LOCK:
+                    tasks = [public_transcription(task) for task in TRANSCRIPTION_TASKS.values()]
+                tasks.sort(key=lambda task: str(task.get("created_at") or ""))
+                self.send_json({"items": tasks})
             else:
                 self.serve_static(path)
         except (RuntimeError, ValueError) as error:
@@ -1222,6 +1485,25 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 scheduled = schedule_restart()
                 self.send_json({"ok": True, "restarting": True, "scheduled": scheduled, "disk_build_id": disk_id})
+            elif path == "/api/transcriptions":
+                raw_items = data.get("items")
+                if not isinstance(raw_items, list) or not raw_items:
+                    raise ValueError("请至少选择一个视频。")
+                created = []
+                for raw in raw_items:
+                    if not isinstance(raw, dict):
+                        continue
+                    url = str(raw.get("url") or "").strip()
+                    if not url:
+                        continue
+                    pages = [str(page) for page in raw.get("pages", []) if str(page).isdigit()]
+                    if not pages and not bool(raw.get("all_pages")):
+                        raise ValueError("转写任务没有可用的分 P。")
+                    source = {"url": url, "title": str(raw.get("title") or "未命名视频"), "pages": pages, "all_pages": bool(raw.get("all_pages"))}
+                    created.append(start_transcription(source))
+                if not created:
+                    raise ValueError("没有可用的视频地址。")
+                self.send_json({"items": created}, HTTPStatus.ACCEPTED)
             elif path == "/api/tasks":
                 pages = [str(page) for page in data.get("pages", []) if str(page).isdigit()]
                 all_pages = bool(data.get("all_pages"))

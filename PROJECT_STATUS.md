@@ -2,30 +2,26 @@
 
 ## 当前成果
 
-- 启动器与 `app.py` 共用 `build_info.py` 的构建文件清单和 `current_build_id()`；包含 `static/asr.js`，不包含 `asr-service`。
-- 启动器继续使用无控制台的 VBS 入口；旧实例会按项目健康接口安全退出后再启动新版本。
-- `app.py` 启动失败时，子进程 stdout/stderr 保存在 `%APPDATA%\\BilibiliDownloader\\logs\\app-startup.log`，启动器日志只记录路径和状态，不吞掉真实 traceback。
-- 客户端已接入真实 ASR Adapter：固定 Base URL 为 `http://127.0.0.1:8765`，使用 `/health`、`POST /v1/jobs`、任务查询、结果、`POST /cancel` 和终态清理；上传使用原生 `FormData`，不手写 Content-Type。
-- CORS 默认仅允许 `http://127.0.0.1:23666` 和 `http://localhost:23666`。
-- `asr-service` 默认使用 `C:\\AI\\FunASR.venv\\Scripts\\python.exe`；引擎优先使用本机 ModelScope 缓存快照，避免代理配置导致已缓存模型无法启动。
-- Mock 仅在 URL `?asr=mock` 或 `localStorage.asr-dev-mode=mock` 下启用；普通离线状态不会伪造转写结果。
+- 已完成“B 站视频 → 临时音频 → 本地 ASR → 文字稿”的后端闭环；自动转写使用独立临时 BBDown 服务目录，不占用用户下载目录。
+- 单视频、UP 主批量、合集/系列详情均新增“转写文字稿”；MP4/M4A 仍进入原下载任务区，转写任务进入“本地转写”多任务区。
+- 本地转写区可同时显示多个任务的名称、阶段、进度、成功/失败原因；成功结果可查看全文/时间轴并复制或导出 TXT/SRT/VTT；手工选择本地音频路径保留。
+- 多 P 音频按实际发现的音频文件分别建立任务；自动流程结束后清理临时音频，并请求 ASR 服务清理其任务文件。
+- 已保留真实登录态和设备 Cookie 会话合并逻辑；日志只记录 Cookie 名称集合，不记录 Cookie 值。
 
 ## 已通过的测试
 
-- `python -m py_compile app.py 启动工具.pyw asr-service/asr_service/config.py`。
-- `node --check static/app.js`、`node --check static/asr.js`。
-- 构建 ID 一致性、VBS 启动、旧实例替换、`static/asr.js` 改动检测通过。
-- 人为启动异常测试通过：`app-startup.log` 保留了真实 `RuntimeError` traceback。
-- 默认 ASR 服务真实启动：`GET /health` 返回 200，`ready=true`，`model_loaded=true`，设备为 `cuda:0`。
-- 真实文件 `C:\\Users\\Atlas\\Downloads\\新录音 12.m4a` 已通过 API 和页面端到端验证：POST 202；状态经历 `processing 5% -> 95% -> succeeded 100%`；结果含 217 字符文本、5 个句段、38 个时间戳；页面全文和时间轴均可见。
-- Mock 的完整、取消、失败及 TXT/SRT/VTT 格式校验仍通过既有测试。
+- `python -m py_compile app.py`、`node --check static/app.js`、`node --check static/asr.js`、`git diff --check`。
+- 本地 ASR 服务真实健康检查通过：`ready=true`、`model_loaded=true`、设备 `cuda:0`。
+- 单视频 `BV1eQNL6JEV2` 真实自动转写通过：临时 M4A 下载成功，ASR 结果 `succeeded`，返回 27,491 字符、3,050 个时间段；临时目录已清理。
+- 目标 UP 主 `24715837` 投稿接口真实返回 18 条、1 页；选取两个投稿分别加入自动转写，两个任务均真实完成。
+- 目标 UP 主合集/系列列表返回 14 个，抽样打开一个合集返回 66 个视频、30 条/页、3 页。
+- 单视频解析保留分 P 逻辑；实测目标视频返回 1 个分 P。普通音频任务接口仍返回 HTTP 202。
 
 ## 未完成 / 尚未验证
 
-- 当前只完成“本地音频 -> ASR”链路，尚未把 B 站下载后的音频自动串入 ASR。
-- 浏览器自动下载目录中的导出文件落盘路径尚未单独核验；导出函数和字幕时间校验已通过。
-- 本轮未改变 B 站解析、登录、UP 主批量、合集/系列和下载任务逻辑；这些路径需在下一轮按现有项目验收清单回归。
+- 尚未用真实多 P 视频完成“多个实际音频文件拆成多个转写任务”的端到端样本；代码已按实际音频文件逐个建任务。
+- 尚未在浏览器中逐项点击验收所有按钮；接口和前端静态语法已验证。普通 MP4 下载、手工本地音频转写、合集转写需继续做页面级回归。
 
 ## 下一步
 
-- 先回归单视频、UP 主批量、合集/系列和下载任务；确认稳定后再设计 B 站媒体到 ASR 的连接，不在当前客户端隐藏自动串联逻辑。
+- 继续做页面级回归：单视频 MP4/M4A、手工本地音频、合集转写、分页和任务导出；确认无回归后提交并推送 `origin/main`。
