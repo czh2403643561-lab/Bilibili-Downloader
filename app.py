@@ -34,6 +34,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from build_info import BUILD_FILES, current_build_id as shared_current_build_id
+from meeting_browser import MeetingBrowserService
 
 APP_NAME = "BilibiliDownloader"
 ROOT = Path(__file__).resolve().parent
@@ -102,6 +103,7 @@ def setup_logging() -> logging.Logger:
 
 
 LOG = logging.getLogger(APP_NAME)
+MEETING_BROWSER = MeetingBrowserService(lambda: APP_DATA)
 
 
 def current_build_id() -> str:
@@ -2226,6 +2228,8 @@ class Handler(SimpleHTTPRequestHandler):
                     tasks = [public_transcription(task) for task in TRANSCRIPTION_TASKS.values()]
                 tasks.sort(key=lambda task: str(task.get("created_at") or ""))
                 self.send_json({"items": tasks})
+            elif path == "/api/meeting/status":
+                self.send_json(MEETING_BROWSER.status())
             else:
                 self.serve_static(path)
         except (RuntimeError, ValueError) as error:
@@ -2297,6 +2301,12 @@ class Handler(SimpleHTTPRequestHandler):
                 with LOGIN_LOCK:
                     LOGIN_STATE.clear()
                 self.send_json({"logged_in": False, "status": "未登录"})
+            elif path == "/api/meeting/login/start":
+                self.send_json(MEETING_BROWSER.start_login(), HTTPStatus.ACCEPTED)
+            elif path == "/api/meeting/logout":
+                self.send_json(MEETING_BROWSER.logout())
+            elif path == "/api/meeting/parse":
+                self.send_json(MEETING_BROWSER.parse(str(data.get("url") or "")), HTTPStatus.ACCEPTED)
             elif path == "/api/parse":
                 if not BBDOWN.exists():
                     raise ValueError("缺少 BBDownNext：请重新双击“启动工具.vbs”自动准备依赖。")
@@ -2324,6 +2334,7 @@ class Handler(SimpleHTTPRequestHandler):
                     int(data.get("page_size", 30) or 30),
                 ))
             elif path == "/api/shutdown":
+                MEETING_BROWSER.shutdown()
                 self.send_json({"ok": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             elif path == "/api/restart":
@@ -2467,6 +2478,7 @@ def main() -> None:
     try:
         server.serve_forever()
     finally:
+        MEETING_BROWSER.shutdown()
         SERVICE.stop()
 
 

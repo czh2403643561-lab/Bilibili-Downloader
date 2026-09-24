@@ -64,6 +64,55 @@ function setOffline() {
 
 async function refreshHealth() { try { setServiceState(await api('/api/health')); } catch (_) { setOffline(); } }
 
+async function refreshMeetingStatus() {
+  try {
+    const meeting = await api('/api/meeting/status');
+    const label = ({ starting: '正在打开登录窗口…', waiting_login: '等待微信扫码登录', checking: '正在核验登录状态…', parsing: '正在后台解析回放…', logged_in: '已登录', logged_out: '未登录', parsed: '已登录', failed: meeting.message || '操作失败', idle: meeting.message || '未登录' })[meeting.status] || meeting.message || '未登录';
+    $('#meeting-login-status').textContent = label;
+    $('#meeting-login').disabled = ['starting', 'waiting_login', 'checking', 'parsing'].includes(meeting.status);
+    $('#meeting-parse').disabled = ['starting', 'waiting_login', 'checking', 'parsing'].includes(meeting.status);
+    $('#meeting-logout').classList.toggle('hidden', !meeting.logged_in);
+    $('#meeting-logout').disabled = ['starting', 'waiting_login', 'checking', 'parsing'].includes(meeting.status);
+    if (['starting', 'waiting_login', 'checking', 'parsing'].includes(meeting.status)) $('#meeting-message').textContent = meeting.message || label;
+    if (meeting.status === 'parsed' && meeting.result) renderMeetingResult(meeting.result);
+    if (meeting.status === 'failed' || meeting.status === 'logged_out') {
+      if (meeting.status === 'failed' || meeting.message.includes('失效')) $('#meeting-message').textContent = meeting.message;
+    }
+  } catch (_) { /* 本地服务连接状态由主 health 检查负责显示 */ }
+}
+
+function renderMeetingResult(result) {
+  $('#meeting-result-title').textContent = result.title || '腾讯会议回放';
+  const duration = result.duration_seconds ? `时长 ${formatDuration(result.duration_seconds)}` : '页面未提供时长';
+  const media = result.media_available ? '已捕获唯一 MP4 视频流；链接与会话凭据仅暂存在本地内存中。' : `检测到 ${result.media_candidate_count || 0} 个 MP4 流，无法安全确定唯一下载源。`;
+  $('#meeting-result-meta').textContent = `${duration} · ${media}`;
+  $('#meeting-result').classList.remove('hidden');
+  $('#meeting-message').textContent = '回放解析完成。当前阶段仅识别可用媒体与信息，不会下载文件。';
+}
+
+async function startMeetingLogin() {
+  $('#meeting-login').disabled = true;
+  $('#meeting-message').textContent = '正在打开腾讯会议官方登录窗口…';
+  try { await api('/api/meeting/login/start', { method: 'POST', body: '{}' }); await refreshMeetingStatus(); }
+  catch (error) { $('#meeting-message').textContent = error.message; $('#meeting-login').disabled = false; }
+}
+
+async function logoutMeeting() {
+  if (!window.confirm('确定退出腾讯会议登录并清除此工具专用的浏览器会话吗？')) return;
+  try { await api('/api/meeting/logout', { method: 'POST', body: '{}' }); $('#meeting-message').textContent = '已退出腾讯会议登录。'; await refreshMeetingStatus(); }
+  catch (error) { $('#meeting-message').textContent = error.message; }
+}
+
+async function parseMeetingRecording() {
+  const url = $('#meeting-url').value.trim();
+  if (!url) { $('#meeting-message').textContent = '请先粘贴腾讯会议回放链接。'; return; }
+  $('#meeting-result').classList.add('hidden');
+  $('#meeting-parse').disabled = true;
+  $('#meeting-message').textContent = '正在后台解析回放…';
+  try { await api('/api/meeting/parse', { method: 'POST', body: JSON.stringify({ url }) }); await refreshMeetingStatus(); }
+  catch (error) { $('#meeting-message').textContent = error.message; $('#meeting-parse').disabled = false; }
+}
+
 async function restartLocalService() {
   if (state.restarting) return;
   state.restarting = true;
@@ -484,6 +533,8 @@ function bindEvents() {
   $('#download-button').addEventListener('click', createTask); $('#choose-first-dir').addEventListener('click', chooseDirectory); $('#choose-dir').addEventListener('click', chooseDirectory);
   $('#open-download-dir').addEventListener('click', () => simpleAction('/api/open-download-directory')); $('#open-logs').addEventListener('click', () => simpleAction('/api/open-log-directory')); $('#export-logs').addEventListener('click', () => simpleAction('/api/export-logs'));
   $('#login-start').addEventListener('click', startLogin); $('#login-logout').addEventListener('click', logout);
+  $('#meeting-login').addEventListener('click', startMeetingLogin); $('#meeting-logout').addEventListener('click', logoutMeeting);
+  $('#meeting-parse').addEventListener('click', parseMeetingRecording); $('#meeting-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseMeetingRecording(); });
   $('#task-list').addEventListener('click', (event) => { const target = event.target; if (target.dataset.stop) stopTask(target.dataset.stop); if (target.dataset.retry) retryTask(target.dataset.retry); });
   $('#up-parse-button').addEventListener('click', parseUp); $('#up-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseUp(); });
   $('#up-filter-button').addEventListener('click', applyUpFilter); $('#up-select-page').addEventListener('click', selectUpPage); $('#up-clear-page').addEventListener('click', clearUpPage); $('#up-clear-selected').addEventListener('click', clearUpSelected);
@@ -505,4 +556,4 @@ function bindEvents() {
   $('#asr-file').addEventListener('change', (event) => setAsrFile(event.target.files?.[0])); $('#asr-new-file').addEventListener('click', () => $('#asr-file').click()); $('#asr-start').addEventListener('click', startAsr); $('#asr-cancel').addEventListener('click', cancelAsr);
   $('#asr-copy').addEventListener('click', copyAsrText); $('#asr-export-txt').addEventListener('click', exportAsrText);
 }
-setupNavigation(); bindEvents(); renderAsr(); renderTranscriptionSettings(); refreshHealth(); refreshLoginStatus(); checkAsrHealth(); refreshTranscriptionSettings(); refreshTranscriptionTasks(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000); setInterval(refreshTranscriptionTasks, 1000); setInterval(refreshAsrWaitLabels, 1000);
+setupNavigation(); bindEvents(); renderAsr(); renderTranscriptionSettings(); refreshHealth(); refreshLoginStatus(); refreshMeetingStatus(); checkAsrHealth(); refreshTranscriptionSettings(); refreshTranscriptionTasks(); setInterval(refreshHealth, 3000); setInterval(refreshMeetingStatus, 2000); setInterval(refreshTasks, 1000); setInterval(refreshTranscriptionTasks, 1000); setInterval(refreshAsrWaitLabels, 1000);

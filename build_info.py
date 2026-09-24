@@ -10,6 +10,7 @@ from pathlib import Path
 BUILD_FILES = (
     "build_info.py",
     "app.py",
+    "meeting_browser.py",
     "启动工具.pyw",
     "static/index.html",
     "static/app.js",

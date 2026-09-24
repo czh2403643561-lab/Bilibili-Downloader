@@ -78,9 +78,11 @@
         <section class="subpage" id="page-meeting-single">
           <div class="card parse-card">
             <label for="meeting-url">腾讯会议回放链接</label>
-            <div class="input-row"><input id="meeting-url" placeholder="https://meeting.tencent.com/cw/..." disabled><button class="primary" disabled>解析回放</button></div>
-            <p class="hint">后续将使用 CourseFlow 管理的腾讯会议登录会话在后台解析，不依赖浏览器插件。</p>
+            <div class="input-row"><input id="meeting-url" placeholder="https://meeting.tencent.com/cw/... 或 /crm/..." autocomplete="url"><button class="primary" id="meeting-parse">解析回放</button></div>
+            <p class="hint">仅解析当前账号有权限访问的单个回放；登录使用独立的 CourseFlow 浏览器资料，不读取你的日常浏览器数据。</p>
+            <p id="meeting-message" class="form-message" role="status"></p>
           </div>
+          <div id="meeting-result" class="card hidden"><div><h2 id="meeting-result-title">腾讯会议回放</h2><p id="meeting-result-meta" class="muted"></p></div></div>
           <div class="card download-options"><div><h2>输出方式</h2><p>功能尚未接入</p></div><div class="segmented"><label><input type="radio" name="meeting-mode" value="video" disabled><span>视频 MP4</span></label><label><input type="radio" name="meeting-mode" value="audio" disabled><span>仅音频 M4A</span></label><label><input type="radio" name="meeting-mode" value="transcribe" disabled><span>转写文字稿</span></label></div><button class="primary" disabled>开始任务</button></div>
         </section>
         <section class="subpage hidden" id="page-meeting-batch">
@@ -106,7 +108,7 @@
       <section class="page hidden" id="page-settings">
         <div class="settings-group"><h2>存储</h2><div class="card settings-row"><div><h3>默认下载目录</h3><p id="download-dir" class="muted">尚未设置</p></div><button class="secondary" id="choose-dir">修改目录</button></div></div>
         <div class="settings-group"><h2>B站账号</h2><div class="card settings-row login-card"><div><p id="login-status" class="muted">检查登录状态…</p><div id="login-qr-panel" class="hidden"><p class="muted">请使用 B 站 App 扫描下方二维码并确认登录。</p><img id="login-qr" alt="B 站扫码登录二维码" class="login-qr-frame"><p><a id="login-qr-link" target="_blank" rel="noreferrer">打开官方扫码页</a></p></div></div><div class="button-group"><button class="secondary" id="login-start">扫码登录</button><button class="secondary hidden" id="login-logout">退出登录</button></div></div></div>
-        <div class="settings-group"><h2>腾讯会议账号</h2><div class="card settings-row"><div><h3>腾讯会议</h3><p class="muted">首次登录将打开腾讯会议官方网页，微信扫码成功后自动关闭；后续解析目标为后台运行。</p><p class="meeting-status">待接入</p></div><button class="secondary" disabled>微信扫码登录</button></div></div>
+        <div class="settings-group"><h2>腾讯会议账号</h2><div class="card settings-row"><div><h3>腾讯会议</h3><p class="muted">扫码会打开 CourseFlow 专用 Edge/Chrome 窗口，不读取日常浏览器配置；确认登录后窗口自动关闭。</p><p id="meeting-login-status" class="meeting-status">检查中</p></div><div class="button-group"><button class="secondary" id="meeting-login">微信扫码登录</button><button class="secondary hidden" id="meeting-logout">退出登录</button></div></div></div>
         <div class="settings-group"><h2>AI 转写</h2><div class="card transcription-settings"><div><h3>转写引擎</h3><p class="muted">新建转写任务使用这里选择的引擎；已运行任务不受影响。</p></div><div class="transcription-setting-row"><label for="transcription-provider">引擎</label><select id="transcription-provider"><option value="local">本地 FunASR</option><option value="mimo-v2.6-flash">小米 MiMo-V2.6-Flash</option></select></div><div id="mimo-key-row" class="transcription-setting-row hidden"><label for="mimo-api-key">MiMo API Key</label><input id="mimo-api-key" type="password" autocomplete="off" placeholder="sk-…"><span id="mimo-key-status" class="muted"></span></div><div class="settings-actions"><p id="transcription-settings-message" class="form-message"></p><button class="primary" id="transcription-save">保存并测试</button></div></div></div>
         <div class="settings-group"><h2>诊断与维护</h2><div class="card settings-row"><div><h3>诊断日志</h3><p class="muted">日志已自动脱敏，不会记录 Cookie、Token 和 MiMo API Key。</p></div><div class="button-group"><button class="secondary" id="open-logs">打开日志目录</button><button class="secondary" id="export-logs">导出诊断日志</button></div></div></div>
       </section>
