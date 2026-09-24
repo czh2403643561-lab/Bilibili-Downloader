@@ -44,9 +44,10 @@ LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ALLOWED_COVER_SUFFIX = ".hdslb.com"
-BUILD_FILES = ("app.py", "启动工具.pyw", "static/index.html", "static/app.js", "static/styles.css")
+BUILD_FILES = ("app.py", "启动工具.pyw", "static/index.html", "static/app.js", "static/asr.js", "static/styles.css")
 BILIBILI_SPACE_API = "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space"
 BILIBILI_ARC_SEARCH_API = "https://api.bilibili.com/x/space/wbi/arc/search"
+BILIBILI_LEGACY_ARC_SEARCH_API = "https://api.bilibili.com/x/space/arc/search"
 BILIBILI_SEASONS_API = "https://api.bilibili.com/x/polymer/web-space/seasons_series_list"
 BILIBILI_SEASON_ARCHIVES_API = "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list"
 BILIBILI_SERIES_ARCHIVES_API = "https://api.bilibili.com/x/series/archives"
@@ -123,6 +124,8 @@ def configure_data_dir(data_dir: str | None) -> None:
         AUTH_FILE = APP_DATA / "bilibili-auth.dat"
         QR_PACKAGE_DIR = APP_DATA / "python-packages"
         LOG_DIR = APP_DATA / "logs"
+        if "BILIBILI_SESSION" in globals():
+            BILIBILI_SESSION.reset()
 
 
 def read_config() -> dict:
@@ -165,24 +168,132 @@ def _dpapi(plain: bytes, protect: bool) -> bytes:
         ctypes.windll.kernel32.LocalFree(output_blob.pbData)
 
 
+DEVICE_COOKIE_NAMES = {"buvid3", "buvid4", "buvid_fp", "b_nut", "b_lsid", "_uuid", "buvid_fp_plain"}
+
+
+class BilibiliSession:
+    """将账号和设备 Cookie 放在同一个加密会话中，且只允许记录名称。"""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.loaded = False
+        self.account: dict[str, str] = {}
+        self.device: dict[str, str] = {}
+
+    @staticmethod
+    def _parse_cookie(value: str) -> dict[str, str]:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(value)
+        except (TypeError, ValueError):
+            return {}
+        return {name: morsel.value for name, morsel in cookie.items() if morsel.value}
+
+    @staticmethod
+    def _header(values: dict[str, str]) -> str:
+        return "; ".join(f"{name}={value}" for name, value in values.items())
+
+    def _load_locked(self) -> None:
+        if self.loaded:
+            return
+        self.loaded = True
+        try:
+            encoded = AUTH_FILE.read_text(encoding="ascii")
+            plain = _dpapi(base64.b64decode(encoded), False).decode("utf-8")
+            decoded = json.loads(plain)
+            if isinstance(decoded, dict) and decoded.get("version") == 2:
+                self.account = {str(k): str(v) for k, v in (decoded.get("account") or {}).items() if v}
+                self.device = {str(k): str(v) for k, v in (decoded.get("device") or {}).items() if v}
+                return
+            raise ValueError("legacy cookie")
+        except (FileNotFoundError, OSError, ValueError, UnicodeError, ctypes.ArgumentError, json.JSONDecodeError):
+            # 兼容旧版只保存账号 Cookie 的 DPAPI 文件；下次保存会自动升级为统一会话格式。
+            try:
+                encoded = AUTH_FILE.read_text(encoding="ascii")
+                legacy = _dpapi(base64.b64decode(encoded), False).decode("utf-8")
+                self.account = self._parse_cookie(legacy)
+            except (FileNotFoundError, OSError, ValueError, UnicodeError, ctypes.ArgumentError):
+                self.account = {}
+
+    def _save_locked(self) -> None:
+        APP_DATA.mkdir(parents=True, exist_ok=True)
+        plain = json.dumps({"version": 2, "account": self.account, "device": self.device}, separators=(",", ":"), ensure_ascii=False)
+        encrypted = _dpapi(plain.encode("utf-8"), True)
+        temporary = AUTH_FILE.with_suffix(".tmp")
+        temporary.write_text(base64.b64encode(encrypted).decode("ascii"), encoding="ascii")
+        temporary.replace(AUTH_FILE)
+
+    def reset(self) -> None:
+        with self.lock:
+            self.loaded = False
+            self.account = {}
+            self.device = {}
+
+    def cookie_header(self, *, account: bool = True, device: bool = True) -> str:
+        with self.lock:
+            self._load_locked()
+            values: dict[str, str] = {}
+            if device:
+                values.update(self.device)
+            if account:
+                values.update(self.account)
+            return self._header(values)
+
+    def cookie_names(self) -> tuple[list[str], list[str]]:
+        with self.lock:
+            self._load_locked()
+            return sorted(self.account), sorted(self.device)
+
+    def log_cookie_names(self, context: str) -> None:
+        account, device = self.cookie_names()
+        LOG.info("B 站会话 %s：account cookie names=%s device cookie names=%s", context, account, device)
+
+    def merge(self, value: str, *, account: bool = False, device: bool = False) -> None:
+        values = self._parse_cookie(value)
+        if not values:
+            return
+        with self.lock:
+            self._load_locked()
+            for name, cookie_value in values.items():
+                target = self.device if name.lower() in DEVICE_COOKIE_NAMES or device else self.account
+                if account and name.lower() not in DEVICE_COOKIE_NAMES:
+                    target = self.account
+                target[name] = cookie_value
+            self._save_locked()
+
+    def merge_set_cookies(self, headers: list[str]) -> None:
+        for header in headers:
+            self.merge(header, account=True)
+
+    def merge_device_values(self, values: dict[str, str]) -> None:
+        with self.lock:
+            self._load_locked()
+            for name, value in values.items():
+                if value:
+                    self.device[name] = value
+            self._save_locked()
+
+    def clear_account(self) -> None:
+        with self.lock:
+            self._load_locked()
+            self.account = {}
+            # 退出账号不丢弃本机设备标识，避免下一次登录又从空设备会话开始。
+            self._save_locked()
+
+
+BILIBILI_SESSION = BilibiliSession()
+
+
 def save_auth_cookie(cookie: str) -> None:
-    APP_DATA.mkdir(parents=True, exist_ok=True)
-    encrypted = _dpapi(cookie.encode("utf-8"), True)
-    temporary = AUTH_FILE.with_suffix(".tmp")
-    temporary.write_text(base64.b64encode(encrypted).decode("ascii"), encoding="ascii")
-    temporary.replace(AUTH_FILE)
+    BILIBILI_SESSION.merge(cookie, account=True)
 
 
 def load_auth_cookie() -> str:
-    try:
-        encoded = AUTH_FILE.read_text(encoding="ascii")
-        return _dpapi(base64.b64decode(encoded), False).decode("utf-8")
-    except (FileNotFoundError, OSError, ValueError, UnicodeError, ctypes.ArgumentError):
-        return ""
+    return BILIBILI_SESSION.cookie_header(account=True, device=False)
 
 
 def clear_auth_cookie() -> None:
-    AUTH_FILE.unlink(missing_ok=True)
+    BILIBILI_SESSION.clear_account()
 
 
 def run_hidden(command: list[str], **kwargs) -> subprocess.Popen:
@@ -461,15 +572,15 @@ def parse_up_mid(value: str) -> str:
     raise ValueError("请输入有效的 UP 主主页链接或 mid。")
 
 
-def bilibili_json(url: str, *, referer: str = "https://www.bilibili.com/", extra_headers: dict | None = None) -> tuple[int, dict]:
+def bilibili_json(url: str, *, referer: str = "https://www.bilibili.com/", extra_headers: dict | None = None, track_response_cookies: bool = True) -> tuple[int, dict]:
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": referer,
         "Origin": "https://space.bilibili.com",
     }
-    saved_cookie = load_auth_cookie()
-    if saved_cookie:
-        headers["Cookie"] = saved_cookie
+    session_cookie = BILIBILI_SESSION.cookie_header()
+    if session_cookie:
+        headers["Cookie"] = session_cookie
     if extra_headers:
         headers.update(extra_headers)
     request = urllib.request.Request(
@@ -478,8 +589,17 @@ def bilibili_json(url: str, *, referer: str = "https://www.bilibili.com/", extra
     )
     try:
         with LOCAL_OPENER.open(request, timeout=15) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
+            if track_response_cookies:
+                BILIBILI_SESSION.merge_set_cookies(response.headers.get_all("Set-Cookie") or [])
+            body = response.read().decode("utf-8", "replace")
+            try:
+                return response.status, json.loads(body)
+            except json.JSONDecodeError:
+                LOG.warning("B 站接口返回非 JSON status=%s host=%s", response.status, urllib.parse.urlsplit(url).netloc)
+                return response.status, {}
     except urllib.error.HTTPError as error:
+        if track_response_cookies:
+            BILIBILI_SESSION.merge_set_cookies(error.headers.get_all("Set-Cookie") or [])
         body = error.read().decode("utf-8", "replace")
         try:
             return error.code, json.loads(body)
@@ -497,7 +617,11 @@ BILIBILI_QR_POLL = "https://passport.bilibili.com/x/passport-login/web/qrcode/po
 
 
 def login_request(url: str) -> tuple[int, dict, list[str]]:
-    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"})
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"}
+    cookie = BILIBILI_SESSION.cookie_header()
+    if cookie:
+        headers["Cookie"] = cookie
+    request = urllib.request.Request(url, headers=headers)
     try:
         with LOCAL_OPENER.open(request, timeout=15) as response:
             return response.status, json.loads(response.read().decode("utf-8")), response.headers.get_all("Set-Cookie") or []
@@ -516,7 +640,10 @@ def login_status_text(code: int) -> str:
 
 
 def start_login() -> dict:
-    status, payload, _ = login_request(BILIBILI_QR_GENERATE)
+    anonymous_cookie()
+    status, payload, set_cookies = login_request(BILIBILI_QR_GENERATE)
+    BILIBILI_SESSION.merge_set_cookies(set_cookies)
+    BILIBILI_SESSION.log_cookie_names("申请二维码后")
     data = payload.get("data") or {}
     if status != 200 or payload.get("code") != 0 or not data.get("url") or not data.get("qrcode_key"):
         raise ValueError("申请 B 站登录二维码失败，请稍后重试。")
@@ -550,7 +677,9 @@ def poll_login() -> dict:
                 pairs.append(f"{name}={query[name][0]}")
         if not pairs:
             raise ValueError("B 站登录成功但未取得登录凭据，请重试。")
-        save_auth_cookie("; ".join(pairs))
+        BILIBILI_SESSION.merge_set_cookies(set_cookies)
+        BILIBILI_SESSION.merge("; ".join(pairs), account=True)
+        BILIBILI_SESSION.log_cookie_names("扫码登录成功后")
         with LOGIN_LOCK:
             LOGIN_STATE.clear()
             LOGIN_STATE["status"] = "登录成功"
@@ -568,6 +697,7 @@ def account_status() -> dict:
         status, payload = bilibili_json("https://api.bilibili.com/x/web-interface/nav", referer="https://www.bilibili.com/")
         data = payload.get("data") or {}
         if status == 200 and payload.get("code") == 0 and data.get("isLogin"):
+            BILIBILI_SESSION.log_cookie_names("登录状态核验")
             return {"logged_in": True, "status": "已登录", "name": data.get("uname") or "B 站账号", "mid": data.get("mid")}
     except ValueError:
         pass
@@ -611,24 +741,22 @@ def qr_svg(value: str) -> bytes:
     return f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="white"/><path d="{path}" fill="black"/></svg>'.encode("utf-8")
 
 
-ANONYMOUS_COOKIE = ""
-
-
 def anonymous_cookie() -> str:
-    global ANONYMOUS_COOKIE
-    if ANONYMOUS_COOKIE:
-        return ANONYMOUS_COOKIE
-    status, payload = bilibili_json("https://api.bilibili.com/x/frontend/finger/spi")
+    existing = BILIBILI_SESSION.cookie_header(account=False, device=True)
+    if "buvid3=" in existing and "buvid4=" in existing:
+        return existing
+    status, payload = bilibili_json("https://api.bilibili.com/x/frontend/finger/spi", extra_headers={"Cookie": ""})
     data = payload.get("data") or {}
-    pairs = [f"{cookie_name}={data[data_name]}" for cookie_name, data_name in (("buvid3", "b_3"), ("buvid4", "b_4")) if data.get(data_name)]
-    if status != 200 or not pairs:
+    values = {cookie_name: str(data[data_name]) for cookie_name, data_name in (("buvid3", "b_3"), ("buvid4", "b_4")) if data.get(data_name)}
+    if status != 200 or not values:
         raise ValueError("B 站匿名访问参数暂时不可用，请稍后重试。")
-    ANONYMOUS_COOKIE = "; ".join(pairs)
-    return ANONYMOUS_COOKIE
+    BILIBILI_SESSION.merge_device_values(values)
+    return BILIBILI_SESSION.cookie_header(account=False, device=True)
 
 
 def request_cookie() -> str:
-    return load_auth_cookie() or anonymous_cookie()
+    anonymous_cookie()
+    return BILIBILI_SESSION.cookie_header()
 
 
 def wbi_signed_query(params: dict) -> str:
@@ -658,7 +786,7 @@ def up_profile(mid: str) -> dict:
     )
     code = payload.get("code")
     if status == 412 or code in {-352, -412}:
-        raise ValueError("B 站暂时要求安全验证，无法获取该 UP 主投稿；请在“设置”中扫码登录后重试。")
+        raise ValueError("已登录但 B 站拒绝了本次 UP 主资料请求，程序正在尝试备用数据源。")
     if code == -799:
         raise ValueError("B 站请求过于频繁，请稍后重试。")
     data = payload.get("data") or {}
@@ -765,7 +893,7 @@ def bili_error(status: int, payload: dict, action: str) -> None:
     code = payload.get("code")
     if status == 412 or code in {-352, -412}:
         LOG.warning("B 站%s触发安全验证 status=%s code=%s message=%s", action, status, code, payload.get("message"))
-        raise ValueError(f"B 站暂时要求安全验证，无法{action}；请在“设置”中扫码登录后重试。")
+        raise ValueError(f"已登录但 B 站拒绝了本次{action}请求，程序正在尝试备用数据源。")
     if code == -799:
         raise ValueError("B 站请求过于频繁，请稍后重试。")
     if code != 0:
@@ -773,8 +901,8 @@ def bili_error(status: int, payload: dict, action: str) -> None:
         raise ValueError(f"B 站{action}失败，请稍后重试。")
 
 
-def fetch_arc_page(mid: str, page: int, keyword: str, page_size: int, owner_name: str) -> dict:
-    query = {
+def arc_search_query(mid: str, page: int, keyword: str, page_size: int) -> dict:
+    return {
         "mid": mid, "pn": page, "ps": page_size, "index": 0, "order": "pubdate", "keyword": keyword,
         "platform": "web", "web_location": "333.1387", "order_avoided": "true",
         "x-bili-locale-json": WEB_LOCALE, "x-bili-device-req-json": WEB_DEVICE,
@@ -783,19 +911,28 @@ def fetch_arc_page(mid: str, page: int, keyword: str, page_size: int, owner_name
         "dm_cover_img_str": "QU5HTEUgKE1pY3Jvc29mdCwgTWljcm9zb2Z0IEJhc2ljIFJlbmRlciBEcml2ZXIgKDB4MDAwMDAwOEMpIERpcmVjdDNEMTEgdnNfNV8wIHBzXzVfMCwgRDNEMTEpR29vZ2xlIEluYy4gKE5WSURJIEdlRm9yY2U",
         "dm_img_inter": json.dumps({"ds": [], "wh": [4922, 5679, 104], "of": [195, 390, 195]}, separators=(",", ":")),
     }
-    status, payload = 0, {}
-    for attempt in range(3):
-        signed_url = BILIBILI_ARC_SEARCH_API + "?" + wbi_signed_query(query)
-        status, payload = bilibili_json(
-            signed_url,
-            referer=f"https://space.bilibili.com/{mid}/video",
-            extra_headers={"Cookie": request_cookie(), "Accept": "application/json, text/plain, */*"},
-        )
-        if status != 412 and payload.get("code") not in {-352, -412, -799}:
-            break
-        if attempt < 2:
-            time.sleep(0.5 * (attempt + 1))
-    bili_error(status, payload, "获取投稿")
+
+
+def arc_search_once(mid: str, page: int, keyword: str, page_size: int, *, cookie: str, headers: dict | None = None, track_response_cookies: bool = True) -> tuple[int, dict]:
+    signed_url = BILIBILI_ARC_SEARCH_API + "?" + wbi_signed_query(arc_search_query(mid, page, keyword, page_size))
+    return bilibili_json(
+        signed_url,
+        referer=f"https://space.bilibili.com/{mid}/video",
+        extra_headers={"Cookie": cookie, "Accept": "application/json, text/plain, */*", **(headers or {})},
+        track_response_cookies=track_response_cookies,
+    )
+
+
+def legacy_arc_search_once(mid: str, page: int, keyword: str, page_size: int, *, cookie: str) -> tuple[int, dict]:
+    query = {"mid": mid, "pn": page, "ps": page_size, "index": 0, "order": "pubdate", "keyword": keyword}
+    return bilibili_json(
+        BILIBILI_LEGACY_ARC_SEARCH_API + "?" + urllib.parse.urlencode(query),
+        referer=f"https://space.bilibili.com/{mid}/upload/video",
+        extra_headers={"Cookie": cookie, "Accept": "application/json, text/plain, */*"},
+    )
+
+
+def arc_page_result(status: int, payload: dict, page: int, page_size: int, owner_name: str, source: str) -> dict:
     data = payload.get("data") or {}
     page_info = data.get("page") or {}
     items = [normalized for raw in (data.get("list") or {}).get("vlist", []) if (normalized := normalize_arc_item(raw, owner_name))]
@@ -803,8 +940,27 @@ def fetch_arc_page(mid: str, page: int, keyword: str, page_size: int, owner_name
     actual_page = int(page_info.get("pn") or page)
     actual_size = int(page_info.get("ps") or page_size)
     if page > 1 and actual_page != page:
-        raise ValueError("B 站返回的投稿分页暂时不可用，请在“设置”中扫码登录后重试。")
-    return {"items": items, "total": count, "page": actual_page, "page_size": actual_size, "total_pages": (count + actual_size - 1) // actual_size if count else 0}
+        raise ValueError("B 站返回的投稿分页不可用，已尝试的投稿数据源均未能给出可信结果。")
+    return {"items": items, "total": count, "page": actual_page, "page_size": actual_size, "total_pages": (count + actual_size - 1) // actual_size if count else 0, "source": source}
+
+
+def fetch_arc_page(mid: str, page: int, keyword: str, page_size: int, owner_name: str) -> dict:
+    cookie = request_cookie()
+    status, payload = arc_search_once(mid, page, keyword, page_size, cookie=cookie)
+    if status != 412 and payload.get("code") not in {-352, -412, -799}:
+        bili_error(status, payload, "获取投稿")
+        return arc_page_result(status, payload, page, page_size, owner_name, "arc-wbi")
+
+    # 新版 WBI 明确拒绝时只切换一次已验证过的旧版官方接口；不对 -352/-412 无限重试或堆叠风控参数。
+    LOG.warning("新版投稿接口被拒绝 status=%s code=%s，切换旧版投稿接口", status, payload.get("code"))
+    legacy_status, legacy_payload = legacy_arc_search_once(mid, page, keyword, page_size, cookie=cookie)
+    legacy_code = legacy_payload.get("code")
+    if legacy_status == 412 or legacy_code in {-352, -412, -799}:
+        if payload.get("code") == -799 or legacy_code == -799:
+            raise ValueError("已登录，但 B 站暂时限制了投稿查询；已尝试可验证的数据源，暂时无法获得可信投稿列表，请稍后再试。")
+        raise ValueError("已登录，但 B 站拒绝了本次投稿请求；已尝试全部可验证的数据源，暂无可信投稿列表。")
+    bili_error(legacy_status, legacy_payload, "获取投稿备用数据")
+    return arc_page_result(legacy_status, legacy_payload, page, page_size, owner_name, "arc-legacy")
 
 
 def fetch_all_arc_items(mid: str, keyword: str, page_size: int, owner_name: str) -> tuple[list[dict], int]:
@@ -827,7 +983,7 @@ def fetch_up_page(value: str, page: int = 1, period: str = "all", keyword: str =
     if period == "all":
         result = fetch_arc_page(mid, page, keyword, page_size, profile["name"])
         profile["total"] = result["total"]
-        return {"profile": profile, "items": result["items"], "total": result["total"], "page": result["page"], "page_size": result["page_size"], "total_pages": result["total_pages"], "source": "arc"}
+        return {"profile": profile, "items": result["items"], "total": result["total"], "page": result["page"], "page_size": result["page_size"], "total_pages": result["total_pages"], "source": result["source"]}
     cache_key = (mid, period, keyword.casefold())
     if cache_key not in UP_FILTER_CACHE:
         all_items, _ = fetch_all_arc_items(mid, keyword, page_size, profile["name"])
@@ -872,7 +1028,10 @@ def fetch_collections(value: str, page: int = 1, page_size: int = 30) -> dict:
             collection_id = str(meta.get("season_id") if kind == "season" else meta.get("series_id") or meta.get("id") or "")
             if not collection_id:
                 continue
-            items.append({"kind": kind, "id": collection_id, "name": meta.get("name") or meta.get("title") or "未命名合集", "cover": str(meta.get("cover") or "").replace("http://", "https://"), "total": int(meta.get("total") or 0)})
+            archives = raw.get("archives") or []
+            first_video = archives[0] if archives and isinstance(archives[0], dict) else {}
+            cover = str(first_video.get("pic") or meta.get("cover") or "").replace("http://", "https://")
+            items.append({"kind": kind, "id": collection_id, "name": meta.get("name") or meta.get("title") or "未命名合集", "cover": cover, "total": int(meta.get("total") or 0)})
     total = int(page_info.get("total") or len(items))
     actual_size = int(page_info.get("page_size") or page_size)
     actual_page = int(page_info.get("page_num") or page)

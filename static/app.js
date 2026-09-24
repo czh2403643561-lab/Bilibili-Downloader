@@ -1,4 +1,4 @@
-const state = { video: null, online: false, stale: false, restarting: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, postsError: '', collectionsError: '', detail: null } };
+const state = { video: null, online: false, stale: false, restarting: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, postsError: '', collectionsError: '', detail: null }, asr: { health: null, file: null, duration: null, job: null, result: null, tab: 'text', polling: null } };
 const $ = (selector) => document.querySelector(selector);
 const PLACEHOLDER_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="328" height="184" viewBox="0 0 328 184"><rect width="328" height="184" fill="#eef0f4"/><path d="M132 78h64v28h-64z" fill="#c5ccd7"/><circle cx="148" cy="88" r="5" fill="#eef0f4"/><path d="m139 101 15-14 10 9 11-12 14 17z" fill="#eef0f4"/><text x="164" y="132" text-anchor="middle" fill="#8d98a8" font-size="14">封面暂时无法加载</text></svg>')}`;
 let loginTimer = null;
@@ -247,7 +247,41 @@ async function startLogin() {
 }
 async function logout() { try { renderLoginStatus(await api('/api/login/logout', { method: 'POST', body: '{}' })); } catch (error) { $('#login-status').textContent = error.message; } }
 
-function setupNavigation() { document.querySelectorAll('.nav-button').forEach((button) => button.addEventListener('click', () => { document.querySelectorAll('.nav-button').forEach((item) => item.classList.remove('active')); document.querySelectorAll('.page').forEach((item) => item.classList.add('hidden')); button.classList.add('active'); $(`#page-${button.dataset.page}`).classList.remove('hidden'); $('#page-title').textContent = ({ single: '单视频下载', up: 'UP 主批量下载', settings: '设置' }[button.dataset.page]); })); }
+const ASR_EXTENSIONS = new Set(['m4a', 'mp3', 'wav', 'flac']);
+const ASR_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
+const ASR_STATUS = { preparing: ['正在准备音频', '正在整理本地音频。'], uploading: ['正在上传', '正在发送至你的本机转写服务。'], queued: ['排队中', '等待本机转写服务处理。'], processing: ['正在转写', '正在由本机转写服务处理。'], succeeded: ['转写完成', '文字稿已准备完成。'], failed: ['转写失败', '本次转写没有完成。'], cancelled: ['已取消', '转写任务已取消。'] };
+function asrFileName() { return state.asr.file?.name?.replace(/\.[^.]+$/, '') || '文字稿'; }
+function formatFileSize(bytes) { if (!Number.isFinite(bytes)) return '大小未知'; if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`; return `${(bytes / 1024 / 1024).toFixed(bytes >= 100 * 1024 * 1024 ? 0 : 1)} MB`; }
+function formatAsrTime(ms) { const value = Math.max(0, Math.floor(ms || 0)); return `${String(Math.floor(value / 60000)).padStart(2, '0')}:${String(Math.floor(value % 60000 / 1000)).padStart(2, '0')}`; }
+function asrMessage(value = '') { $('#asr-message').textContent = value; }
+function renderAsr() {
+  const asr = state.asr; const health = asr.health; const healthEl = $('#asr-health');
+  healthEl.textContent = health?.message || '检查中'; healthEl.classList.toggle('ready', Boolean(health?.available)); healthEl.classList.toggle('problem', health?.mode === 'offline');
+  const info = $('#asr-file-info'); info.classList.toggle('hidden', !asr.file); if (asr.file) info.textContent = `${asr.file.name} · ${formatFileSize(asr.file.size)}${Number.isFinite(asr.duration) ? ` · ${formatAsrTime(asr.duration * 1000)}` : ''}`;
+  $('#asr-start').disabled = !asr.file || !health?.available || Boolean(asr.job && !['failed', 'cancelled', 'succeeded'].includes(asr.job.status)); $('#asr-new-file').classList.toggle('hidden', !asr.file);
+  const job = asr.job; $('#asr-status-card').classList.toggle('hidden', !job); if (job) { const key = job.phase || job.status; const copy = ASR_STATUS[key] || ['转写状态未知', '']; $('#asr-status-title').textContent = copy[0]; $('#asr-status-detail').textContent = copy[1]; $('#asr-cancel').classList.toggle('hidden', !['queued', 'processing'].includes(job.status)); document.querySelectorAll('[data-asr-step]').forEach((step) => { const order = ['preparing', 'uploading', 'queued', 'processing', 'succeeded']; const activeIndex = order.indexOf(key); const ownIndex = order.indexOf(step.dataset.asrStep); step.classList.toggle('active', ownIndex <= activeIndex && key !== 'failed' && key !== 'cancelled'); }); }
+  $('#asr-result').classList.toggle('hidden', !asr.result); if (!asr.result) return;
+  $('#asr-result-meta').textContent = health?.mode === 'mock' ? '模拟模式结果 / 等待真实 ASR 服务' : '本地转写结果'; $('#asr-text').textContent = asr.result.text;
+  const timeline = $('#asr-timeline'); timeline.innerHTML = asr.result.segments.map((segment) => `<article class="asr-segment"><time>${formatAsrTime(segment.start_ms)}</time><div>${segment.speaker ? `<strong>${escapeHtml(segment.speaker)}</strong>` : ''}<p>${escapeHtml(segment.text)}</p></div></article>`).join('');
+  $('#asr-tab-text').classList.toggle('active', asr.tab === 'text'); $('#asr-tab-timeline').classList.toggle('active', asr.tab === 'timeline'); $('#asr-text').classList.toggle('hidden', asr.tab !== 'text'); timeline.classList.toggle('hidden', asr.tab !== 'timeline');
+  const valid = asr.result.segments.length && asr.result.segments.every(AsrClient.validSegment); $('#asr-export-srt').disabled = !valid; $('#asr-export-vtt').disabled = !valid;
+}
+async function checkAsrHealth() { try { state.asr.health = await AsrClient.checkHealth(); } catch (_) { state.asr.health = { mode: 'offline', available: false, message: '本地转写服务未启动' }; } renderAsr(); }
+async function setAsrFile(file) {
+  asrMessage(''); if (!file) return; const extension = file.name.split('.').pop().toLowerCase();
+  if (!ASR_EXTENSIONS.has(extension)) { asrMessage('请选择 M4A、MP3、WAV 或 FLAC 音频文件。'); $('#asr-file').value = ''; return; }
+  if (file.size > ASR_MAX_FILE_BYTES) { asrMessage('音频文件超过 2 GB，暂不支持转写。'); $('#asr-file').value = ''; return; }
+  state.asr.file = file; state.asr.duration = null; state.asr.job = null; state.asr.result = null;
+  const audio = document.createElement('audio'); const url = URL.createObjectURL(file); audio.onloadedmetadata = () => { state.asr.duration = Number.isFinite(audio.duration) ? audio.duration : null; URL.revokeObjectURL(url); renderAsr(); }; audio.onerror = () => { URL.revokeObjectURL(url); renderAsr(); }; audio.src = url; renderAsr();
+}
+function stopAsrPolling() { if (state.asr.polling) clearInterval(state.asr.polling); state.asr.polling = null; }
+async function pollAsrJob() { const job = state.asr.job; if (!job) return; try { state.asr.job = await AsrClient.getJob(job.task_id); if (state.asr.job.status === 'succeeded') { state.asr.result = await AsrClient.getJobResult(job.task_id); stopAsrPolling(); } if (['failed', 'cancelled'].includes(state.asr.job.status)) stopAsrPolling(); } catch (error) { state.asr.job = { ...job, status: 'failed', error: error.message }; stopAsrPolling(); asrMessage('转写服务暂时不可用。'); } renderAsr(); }
+async function startAsr() { if (!state.asr.file) { asrMessage('请先选择本地音频文件。'); return; } asrMessage(''); try { state.asr.job = await AsrClient.createTranscriptionJob({ type: 'local_file', file: state.asr.file }); state.asr.result = null; renderAsr(); stopAsrPolling(); state.asr.polling = setInterval(pollAsrJob, 350); await pollAsrJob(); } catch (error) { asrMessage(error.message); renderAsr(); } }
+async function cancelAsr() { if (!state.asr.job) return; try { state.asr.job = await AsrClient.cancelJob(state.asr.job.task_id); stopAsrPolling(); } catch (error) { asrMessage(error.message); } renderAsr(); }
+async function copyAsrText() { try { await navigator.clipboard.writeText(state.asr.result?.text || ''); asrMessage('全文已复制。'); } catch (_) { asrMessage('无法自动复制，请手动选择文字稿。'); } }
+function exportAsr(kind) { try { const text = AsrClient.exportText(state.asr.result, kind); const blob = new Blob([text], { type: kind === 'txt' ? 'text/plain;charset=utf-8' : 'text/plain;charset=utf-8' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `${asrFileName()}.${kind}`; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 0); } catch (error) { asrMessage(error.message); } }
+
+function setupNavigation() { document.querySelectorAll('.nav-button').forEach((button) => button.addEventListener('click', () => { document.querySelectorAll('.nav-button').forEach((item) => item.classList.remove('active')); document.querySelectorAll('.page').forEach((item) => item.classList.add('hidden')); button.classList.add('active'); $(`#page-${button.dataset.page}`).classList.remove('hidden'); $('#page-title').textContent = ({ single: '单视频下载', up: 'UP 主批量下载', asr: '本地 AI 转写', settings: '设置' }[button.dataset.page]); if (button.dataset.page === 'asr') checkAsrHealth(); })); }
 function bindEvents() {
   $('#parse-button').addEventListener('click', parseVideo); $('#video-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseVideo(); });
   $('#select-all').addEventListener('click', () => document.querySelectorAll('#page-list input').forEach((input) => input.checked = true));
@@ -267,5 +301,7 @@ function bindEvents() {
   $('#up-detail-select-page').addEventListener('click', () => { (state.up.detail?.items || []).forEach((item) => { state.up.selected[item.bvid] = item; }); renderUp(); });
   $('#up-detail-clear-page').addEventListener('click', () => { (state.up.detail?.items || []).forEach((item) => delete state.up.selected[item.bvid]); renderUp(); });
   $('#up-clear-selected-detail').addEventListener('click', clearUpSelected);
+  $('#asr-file').addEventListener('change', (event) => setAsrFile(event.target.files?.[0])); $('#asr-new-file').addEventListener('click', () => $('#asr-file').click()); $('#asr-start').addEventListener('click', startAsr); $('#asr-cancel').addEventListener('click', cancelAsr);
+  $('#asr-tab-text').addEventListener('click', () => { state.asr.tab = 'text'; renderAsr(); }); $('#asr-tab-timeline').addEventListener('click', () => { state.asr.tab = 'timeline'; renderAsr(); }); $('#asr-copy').addEventListener('click', copyAsrText); $('#asr-export-txt').addEventListener('click', () => exportAsr('txt')); $('#asr-export-srt').addEventListener('click', () => exportAsr('srt')); $('#asr-export-vtt').addEventListener('click', () => exportAsr('vtt'));
 }
-setupNavigation(); bindEvents(); refreshHealth(); refreshLoginStatus(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000);
+setupNavigation(); bindEvents(); renderAsr(); refreshHealth(); refreshLoginStatus(); checkAsrHealth(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000);
