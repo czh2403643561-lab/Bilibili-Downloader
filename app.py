@@ -657,6 +657,37 @@ def mimo_response_text(payload: object) -> str:
     return ""
 
 
+def _response_text_length(value: object) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(len(item.get("text", "")) for item in value if isinstance(item, dict) and isinstance(item.get("text"), str))
+    return 0
+
+
+def mimo_response_metadata(payload: object) -> dict[str, object]:
+    choices = payload.get("choices") if isinstance(payload, dict) else []
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    usage = payload.get("usage") if isinstance(payload, dict) and isinstance(payload.get("usage"), dict) else {}
+    completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    usage_values = {
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "audio_tokens": prompt_details.get("audio_tokens", usage.get("audio_tokens")),
+        "audio_seconds": prompt_details.get("audio_seconds", usage.get("audio_seconds")),
+        "reasoning_tokens": completion_details.get("reasoning_tokens", usage.get("reasoning_tokens")),
+    }
+    return {
+        "finish_reason": choice.get("finish_reason"),
+        "content_chars": len(mimo_response_text(payload)),
+        "reasoning_content_chars": _response_text_length(message.get("reasoning_content")),
+        "usage": {key: value for key, value in usage_values.items() if value is not None},
+    }
+
+
 def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model: str) -> dict:
     api_key = load_mimo_api_key()
     if not api_key:
@@ -672,13 +703,50 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
             payload = {"model": model, "messages": messages, "asr_options": {"language": "zh"}}
         else:
             messages = [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": audio_data}}, {"type": "text", "text": "忠实转写音频原话，不总结、不润色、不补充内容。"}]}]
-            payload = {"model": model, "messages": messages, "max_completion_tokens": 4096}
+            payload = {
+                "model": model,
+                "messages": messages,
+                "thinking": {"type": "disabled"},
+                "max_completion_tokens": 65536,
+            }
         try:
             status, response = mimo_request("/chat/completions", api_key, payload)
+            metadata = mimo_response_metadata(response)
+            LOG.info(
+                "MiMo response provider=%s model=%s chunk=%s/%s bytes=%s status=%s finish_reason=%s usage=%s content_chars=%s reasoning_content_chars=%s",
+                provider,
+                model,
+                index,
+                len(chunks),
+                chunk.stat().st_size,
+                status,
+                metadata["finish_reason"],
+                metadata["usage"],
+                metadata["content_chars"],
+                metadata["reasoning_content_chars"],
+            )
             if status < 200 or status >= 300:
                 raise RuntimeError(asr_error_message(response, f"MiMo 第 {index}/{len(chunks)} 个音频片段请求失败。"))
+            finish_reason = metadata["finish_reason"]
+            if finish_reason in {"length", "max_tokens"}:
+                raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 个音频片段输出达到 token 上限（finish_reason={finish_reason}）。")
+            if finish_reason not in {None, "stop"}:
+                raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 个音频片段返回异常（finish_reason={finish_reason}）。")
             text = mimo_response_text(response)
             if not text:
+                LOG.warning(
+                    "MiMo empty content provider=%s model=%s chunk=%s/%s bytes=%s status=%s finish_reason=%s usage=%s content_chars=%s reasoning_content_chars=%s",
+                    provider,
+                    model,
+                    index,
+                    len(chunks),
+                    chunk.stat().st_size,
+                    status,
+                    metadata["finish_reason"],
+                    metadata["usage"],
+                    metadata["content_chars"],
+                    metadata["reasoning_content_chars"],
+                )
                 raise RuntimeError("MiMo 返回空文字稿。")
             texts.append(text)
         except Exception as error:
@@ -1557,6 +1625,32 @@ def short_error(value: object) -> str:
     return text[:100] + ("…" if len(text) > 100 else "")
 
 
+def flush_log_handlers() -> None:
+    for handler in LOG.handlers:
+        try:
+            handler.flush()
+        except OSError:
+            pass
+
+
+def reveal_diagnostics_in_explorer(target: Path) -> bool:
+    try:
+        subprocess.Popen(
+            ["explorer.exe", f"/select,{target}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return True
+    except OSError as error:
+        LOG.warning("无法在资源管理器中定位诊断包：%s", error)
+        try:
+            os.startfile(LOG_DIR)  # type: ignore[attr-defined]
+        except OSError as directory_error:
+            LOG.warning("无法打开日志目录：%s", directory_error)
+        return False
+
+
 class Handler(SimpleHTTPRequestHandler):
     server_version = "BilibiliDownloader/0.1"
 
@@ -1828,11 +1922,12 @@ class Handler(SimpleHTTPRequestHandler):
                 os.startfile(LOG_DIR)  # type: ignore[attr-defined]
                 self.send_json({"ok": True})
             elif path == "/api/export-logs":
-                target = APP_DATA / f"{APP_NAME}-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip"
+                flush_log_handlers()
+                target = LOG_DIR / f"{APP_NAME}-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip"
                 with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
                     for log_file in LOG_DIR.glob("*.log"):
                         archive.write(log_file, log_file.name)
-                os.startfile(target)  # type: ignore[attr-defined]
+                reveal_diagnostics_in_explorer(target)
                 self.send_json({"path": str(target)})
             else:
                 self.send_json({"error": "未找到接口。"}, 404)
