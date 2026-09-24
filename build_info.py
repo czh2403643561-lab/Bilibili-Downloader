@@ -11,6 +11,7 @@ BUILD_FILES = (
     "build_info.py",
     "app.py",
     "meeting_browser.py",
+    "meeting_bridge.py",
     "启动工具.pyw",
     "static/index.html",
     "static/app.js",

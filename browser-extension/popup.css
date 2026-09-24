@@ -1,0 +1,7 @@
+body { width: 260px; margin: 0; color: #273143; background: #f5f7fb; font: 14px/1.5 "Segoe UI", sans-serif; }
+main { padding: 18px; }
+h1 { margin: 0 0 14px; font-size: 16px; }
+.status { margin: 0 0 10px; color: #687386; }
+.status.ready { color: #24724a; }
+.hint { margin: 0 0 16px; color: #778296; font-size: 12px; }
+button { width: 100%; padding: 9px 12px; border: 0; border-radius: 8px; color: #fff; background: #fb7299; cursor: pointer; }

@@ -1,4 +1,4 @@
-const state = { video: null, online: false, stale: false, restarting: false, directorySelecting: false, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), transcription: { provider: 'local', model: '', label: '', mimo_api_key_configured: false, mimo_api_key_hint: '' }, up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, postsError: '', collectionsError: '', detail: null }, asr: { health: null, file: null, duration: null, job: null, result: null, polling: null, tasks: [], activeTaskId: null, manageMode: false, selectedTaskIds: [] } };
+const state = { video: null, online: false, stale: false, restarting: false, directorySelecting: false, meeting: { connected: false, taskId: null }, taskOptions: JSON.parse(localStorage.getItem('bbdown-task-options') || '{}'), transcription: { provider: 'local', model: '', label: '', mimo_api_key_configured: false, mimo_api_key_hint: '' }, up: { input: '', profile: null, items: [], selected: {}, page: 1, total: 0, totalPages: 0, period: 'all', keyword: '', loading: false, tab: 'posts', collections: [], collectionPage: 1, collectionTotal: 0, collectionTotalPages: 0, collectionLoading: false, postsError: '', collectionsError: '', detail: null }, asr: { health: null, file: null, duration: null, job: null, result: null, polling: null, tasks: [], activeTaskId: null, manageMode: false, selectedTaskIds: [] } };
 const $ = (selector) => document.querySelector(selector);
 const PLACEHOLDER_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="328" height="184" viewBox="0 0 328 184"><rect width="328" height="184" fill="#eef0f4"/><path d="M132 78h64v28h-64z" fill="#c5ccd7"/><circle cx="148" cy="88" r="5" fill="#eef0f4"/><path d="m139 101 15-14 10 9 11-12 14 17z" fill="#eef0f4"/><text x="164" y="132" text-anchor="middle" fill="#8d98a8" font-size="14">封面暂时无法加载</text></svg>')}`;
 let loginTimer = null;
@@ -66,51 +66,68 @@ async function refreshHealth() { try { setServiceState(await api('/api/health'))
 
 async function refreshMeetingStatus() {
   try {
-    const meeting = await api('/api/meeting/status');
-    const label = ({ starting: '正在打开登录窗口…', waiting_login: '等待微信扫码登录', checking: '正在核验登录状态…', parsing: '正在后台解析回放…', logged_in: '已登录', logged_out: '未登录', parsed: '已登录', failed: meeting.message || '操作失败', idle: meeting.message || '未登录' })[meeting.status] || meeting.message || '未登录';
-    $('#meeting-login-status').textContent = label;
-    $('#meeting-login').disabled = ['starting', 'waiting_login', 'checking', 'parsing'].includes(meeting.status);
-    $('#meeting-parse').disabled = ['starting', 'waiting_login', 'checking', 'parsing'].includes(meeting.status);
-    $('#meeting-logout').classList.toggle('hidden', !meeting.logged_in);
-    $('#meeting-logout').disabled = ['starting', 'waiting_login', 'checking', 'parsing'].includes(meeting.status);
-    if (['starting', 'waiting_login', 'checking', 'parsing'].includes(meeting.status)) $('#meeting-message').textContent = meeting.message || label;
-    if (meeting.status === 'parsed' && meeting.result) renderMeetingResult(meeting.result);
-    if (meeting.status === 'failed' || meeting.status === 'logged_out') {
-      if (meeting.status === 'failed' || meeting.message.includes('失效')) $('#meeting-message').textContent = meeting.message;
+    const bridge = await api('/api/meeting-bridge/status');
+    state.meeting.connected = Boolean(bridge.connected);
+    $('#meeting-bridge-settings-status').textContent = bridge.connected
+      ? `浏览器插件已连接${bridge.browser ? `（${bridge.browser === 'edge' ? 'Edge' : 'Chrome'}）` : ''}`
+      : '未检测到 CourseFlow 浏览器插件';
+    $('#meeting-parse').disabled = !bridge.connected;
+    if (!state.meeting.taskId) {
+      $('#meeting-message').textContent = bridge.connected ? '' : '未检测到 CourseFlow 浏览器插件。请在 Chrome 或 Edge 中启用桥接扩展。';
+      return;
+    }
+    const task = await api(`/api/meeting-bridge/tasks/${state.meeting.taskId}`);
+    const messages = {
+      pending: '等待浏览器插件领取解析任务…',
+      processing: ({
+        opening: '正在打开回放…',
+        waiting_page: '正在等待回放页面…',
+        waiting_media: '正在识别媒体…',
+        submitting: '正在回传解析结果…'
+      })[task.stage] || '浏览器插件正在解析回放…',
+      success: '解析成功，已找到视频资源。下载功能将在下一阶段接入。',
+      failed: task.error?.message || '回放解析失败。'
+    };
+    $('#meeting-message').textContent = messages[task.status] || '等待浏览器插件…';
+    if (task.status === 'success') {
+      renderMeetingResult({ title: task.title, duration_seconds: task.duration_seconds, media_found: task.media_found });
+      $('#meeting-parse').disabled = !bridge.connected;
+    } else {
+      $('#meeting-result').classList.add('hidden');
+      $('#meeting-parse').disabled = !bridge.connected || ['pending', 'processing'].includes(task.status);
     }
   } catch (_) { /* 本地服务连接状态由主 health 检查负责显示 */ }
 }
 
 function renderMeetingResult(result) {
   $('#meeting-result-title').textContent = result.title || '腾讯会议回放';
-  const duration = result.duration_seconds ? `时长 ${formatDuration(result.duration_seconds)}` : '页面未提供时长';
-  const media = result.media_available ? '已捕获唯一 MP4 视频流；链接与会话凭据仅暂存在本地内存中。' : `检测到 ${result.media_candidate_count || 0} 个 MP4 流，无法安全确定唯一下载源。`;
+  const duration = result.duration_seconds ? `时长 ${formatMeetingDuration(result.duration_seconds)}` : '页面未提供时长';
+  const media = result.media_found ? '已找到视频资源。' : '未能确认视频资源。';
   $('#meeting-result-meta').textContent = `${duration} · ${media}`;
   $('#meeting-result').classList.remove('hidden');
-  $('#meeting-message').textContent = '回放解析完成。当前阶段仅识别可用媒体与信息，不会下载文件。';
-}
-
-async function startMeetingLogin() {
-  $('#meeting-login').disabled = true;
-  $('#meeting-message').textContent = '正在打开腾讯会议官方登录窗口…';
-  try { await api('/api/meeting/login/start', { method: 'POST', body: '{}' }); await refreshMeetingStatus(); }
-  catch (error) { $('#meeting-message').textContent = error.message; $('#meeting-login').disabled = false; }
-}
-
-async function logoutMeeting() {
-  if (!window.confirm('确定退出腾讯会议登录并清除此工具专用的浏览器会话吗？')) return;
-  try { await api('/api/meeting/logout', { method: 'POST', body: '{}' }); $('#meeting-message').textContent = '已退出腾讯会议登录。'; await refreshMeetingStatus(); }
-  catch (error) { $('#meeting-message').textContent = error.message; }
+  $('#meeting-message').textContent = '回放解析已完成，下载功能将在下一阶段接入。';
 }
 
 async function parseMeetingRecording() {
   const url = $('#meeting-url').value.trim();
   if (!url) { $('#meeting-message').textContent = '请先粘贴腾讯会议回放链接。'; return; }
+  if (!state.meeting.connected) { $('#meeting-message').textContent = '未检测到 CourseFlow 浏览器插件，请先启用扩展后重试。'; return; }
   $('#meeting-result').classList.add('hidden');
   $('#meeting-parse').disabled = true;
-  $('#meeting-message').textContent = '正在后台解析回放…';
-  try { await api('/api/meeting/parse', { method: 'POST', body: JSON.stringify({ url }) }); await refreshMeetingStatus(); }
+  $('#meeting-message').textContent = '正在创建解析任务…';
+  try {
+    const response = await api('/api/meeting-bridge/tasks', { method: 'POST', body: JSON.stringify({ url }) });
+    state.meeting.taskId = response.item.task_id;
+    await refreshMeetingStatus();
+  }
   catch (error) { $('#meeting-message').textContent = error.message; $('#meeting-parse').disabled = false; }
+}
+
+function formatMeetingDuration(value) {
+  const seconds = Math.max(0, Math.floor(Number(value) || 0));
+  const parts = [seconds % 60, Math.floor(seconds / 60) % 60];
+  if (Math.floor(seconds / 3600)) parts.push(Math.floor(seconds / 3600));
+  return parts.reverse().map((part, index) => index ? String(part).padStart(2, '0') : String(part)).join(':');
 }
 
 async function restartLocalService() {
@@ -533,7 +550,7 @@ function bindEvents() {
   $('#download-button').addEventListener('click', createTask); $('#choose-first-dir').addEventListener('click', chooseDirectory); $('#choose-dir').addEventListener('click', chooseDirectory);
   $('#open-download-dir').addEventListener('click', () => simpleAction('/api/open-download-directory')); $('#open-logs').addEventListener('click', () => simpleAction('/api/open-log-directory')); $('#export-logs').addEventListener('click', () => simpleAction('/api/export-logs'));
   $('#login-start').addEventListener('click', startLogin); $('#login-logout').addEventListener('click', logout);
-  $('#meeting-login').addEventListener('click', startMeetingLogin); $('#meeting-logout').addEventListener('click', logoutMeeting);
+  $('#meeting-bridge-check').addEventListener('click', refreshMeetingStatus);
   $('#meeting-parse').addEventListener('click', parseMeetingRecording); $('#meeting-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseMeetingRecording(); });
   $('#task-list').addEventListener('click', (event) => { const target = event.target; if (target.dataset.stop) stopTask(target.dataset.stop); if (target.dataset.retry) retryTask(target.dataset.retry); });
   $('#up-parse-button').addEventListener('click', parseUp); $('#up-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseUp(); });

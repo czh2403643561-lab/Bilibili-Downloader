@@ -35,6 +35,7 @@ from pathlib import Path
 
 from build_info import BUILD_FILES, current_build_id as shared_current_build_id
 from meeting_browser import MeetingBrowserService
+from meeting_bridge import BRIDGE_EXTENSION_ID, MeetingBridgeService
 
 APP_NAME = "BilibiliDownloader"
 ROOT = Path(__file__).resolve().parent
@@ -104,6 +105,7 @@ def setup_logging() -> logging.Logger:
 
 LOG = logging.getLogger(APP_NAME)
 MEETING_BROWSER = MeetingBrowserService(lambda: APP_DATA)
+MEETING_BRIDGE = MeetingBridgeService(BRIDGE_EXTENSION_ID)
 
 
 def current_build_id() -> str:
@@ -2120,6 +2122,67 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def send_bridge_json(self, data: object, status: int = 200, origin: str | None = None) -> None:
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        if MEETING_BRIDGE.origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def read_bridge_json(self) -> dict:
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            raise ValueError("桥接请求格式无效。")
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > 256 * 1024:
+            raise ValueError("桥接请求大小无效。")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("桥接请求格式无效。") from error
+        if not isinstance(payload, dict):
+            raise ValueError("桥接请求格式无效。")
+        return payload
+
+    def bridge_authorized(self) -> bool:
+        return MEETING_BRIDGE.authorized(
+            self.headers.get("Origin"),
+            self.headers.get("X-CourseFlow-Bridge-Token"),
+        )
+
+    def send_bridge_preflight(self) -> None:
+        origin = self.headers.get("Origin")
+        requested_method = self.headers.get("Access-Control-Request-Method", "").upper()
+        requested_headers = {
+            item.strip().lower()
+            for item in self.headers.get("Access-Control-Request-Headers", "").split(",")
+            if item.strip()
+        }
+        allowed_headers = {"content-type", "x-courseflow-bridge-token"}
+        if (
+            not self.path.startswith("/api/meeting-bridge/")
+            or not MEETING_BRIDGE.origin_allowed(origin)
+            or requested_method not in {"GET", "POST"}
+            or not requested_headers.issubset(allowed_headers)
+        ):
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-CourseFlow-Bridge-Token")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Vary", "Origin")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_OPTIONS(self) -> None:
+        self.send_bridge_preflight()
+
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
@@ -2180,6 +2243,39 @@ class Handler(SimpleHTTPRequestHandler):
                     "download_dir": config.get("download_dir", ""),
                     "dependency_problem": SERVICE.dependency_problem(),
                 })
+            elif path == "/api/meeting-bridge/status":
+                self.send_bridge_json(MEETING_BRIDGE.status(), origin=self.headers.get("Origin"))
+            elif path == "/api/meeting-bridge/pair":
+                origin = self.headers.get("Origin")
+                try:
+                    self.send_bridge_json(MEETING_BRIDGE.pair(origin), origin=origin)
+                except PermissionError:
+                    self.send_bridge_json({"error": "浏览器扩展来源未获授权。"}, HTTPStatus.FORBIDDEN, origin)
+            elif path == "/api/meeting-bridge/tasks/next":
+                origin = self.headers.get("Origin")
+                if not self.bridge_authorized():
+                    self.send_bridge_json({"error": "浏览器桥接鉴权失败。"}, HTTPStatus.FORBIDDEN, origin)
+                else:
+                    try:
+                        task = MEETING_BRIDGE.claim_next(origin, self.headers.get("X-CourseFlow-Bridge-Token"))
+                    except PermissionError:
+                        self.send_bridge_json({"error": "浏览器桥接鉴权失败。"}, HTTPStatus.FORBIDDEN, origin)
+                    else:
+                        if task is None:
+                            self.send_response(HTTPStatus.NO_CONTENT)
+                            if MEETING_BRIDGE.origin_allowed(origin):
+                                self.send_header("Access-Control-Allow-Origin", origin)
+                                self.send_header("Vary", "Origin")
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                        else:
+                            self.send_bridge_json(task, origin=origin)
+            elif re.fullmatch(r"/api/meeting-bridge/tasks/[a-f0-9]{24}", path):
+                task_id = path.rsplit("/", 1)[-1]
+                try:
+                    self.send_json(MEETING_BRIDGE.get_task(task_id))
+                except KeyError as error:
+                    self.send_json({"error": short_error(error)}, HTTPStatus.NOT_FOUND)
             elif path == "/api/cover":
                 cover_url = urllib.parse.parse_qs(parsed_url.query).get("url", [""])[0]
                 body, content_type = get_cover(cover_url)
@@ -2250,11 +2346,68 @@ class Handler(SimpleHTTPRequestHandler):
                 except ValueError as error:
                     self.send_json({"error": short_error(error)}, HTTPStatus.CONFLICT)
                 return
+            if path == "/api/meeting-bridge/heartbeat":
+                origin = self.headers.get("Origin")
+                if not self.bridge_authorized():
+                    self.send_bridge_json({"error": "浏览器桥接鉴权失败。"}, HTTPStatus.FORBIDDEN, origin)
+                    return
+                try:
+                    payload = self.read_bridge_json()
+                    result = MEETING_BRIDGE.heartbeat(origin, self.headers.get("X-CourseFlow-Bridge-Token"), payload)
+                    self.send_bridge_json(result, origin=origin)
+                except ValueError as error:
+                    self.send_bridge_json({"error": short_error(error)}, HTTPStatus.BAD_REQUEST, origin)
+                return
+            bridge_result_match = re.fullmatch(r"/api/meeting-bridge/tasks/([a-f0-9]{24})/result", path)
+            if bridge_result_match:
+                origin = self.headers.get("Origin")
+                if not self.bridge_authorized():
+                    self.send_bridge_json({"error": "浏览器桥接鉴权失败。"}, HTTPStatus.FORBIDDEN, origin)
+                    return
+                try:
+                    payload = self.read_bridge_json()
+                except ValueError as error:
+                    self.send_bridge_json({"error": short_error(error)}, HTTPStatus.BAD_REQUEST, origin)
+                    return
+                try:
+                    result = MEETING_BRIDGE.finish(
+                        bridge_result_match.group(1), origin,
+                        self.headers.get("X-CourseFlow-Bridge-Token"), payload,
+                    )
+                except KeyError as error:
+                    self.send_bridge_json({"error": short_error(error)}, HTTPStatus.NOT_FOUND, origin)
+                except ValueError as error:
+                    self.send_bridge_json({"error": short_error(error)}, HTTPStatus.CONFLICT, origin)
+                else:
+                    self.send_bridge_json(result, origin=origin)
+                return
+            bridge_progress_match = re.fullmatch(r"/api/meeting-bridge/tasks/([a-f0-9]{24})/progress", path)
+            if bridge_progress_match:
+                origin = self.headers.get("Origin")
+                if not self.bridge_authorized():
+                    self.send_bridge_json({"error": "浏览器桥接鉴权失败。"}, HTTPStatus.FORBIDDEN, origin)
+                    return
+                try:
+                    payload = self.read_bridge_json()
+                    result = MEETING_BRIDGE.update_progress(
+                        bridge_progress_match.group(1), origin,
+                        self.headers.get("X-CourseFlow-Bridge-Token"), payload.get("stage"),
+                    )
+                except KeyError as error:
+                    self.send_bridge_json({"error": short_error(error)}, HTTPStatus.NOT_FOUND, origin)
+                except ValueError as error:
+                    self.send_bridge_json({"error": short_error(error)}, HTTPStatus.CONFLICT, origin)
+                else:
+                    self.send_bridge_json(result, origin=origin)
+                return
             if path == "/api/transcriptions/manual":
                 self.handle_manual_transcription_upload()
                 return
             data = self.read_json()
-            if path == "/api/select-directory":
+            if path == "/api/meeting-bridge/tasks":
+                item = MEETING_BRIDGE.create_task(str(data.get("url") or ""))
+                self.send_json({"item": item}, HTTPStatus.ACCEPTED)
+            elif path == "/api/select-directory":
                 selected = select_folder()
                 if not selected:
                     self.send_json({"cancelled": True})
@@ -2335,6 +2488,7 @@ class Handler(SimpleHTTPRequestHandler):
                 ))
             elif path == "/api/shutdown":
                 MEETING_BROWSER.shutdown()
+                MEETING_BRIDGE.shutdown()
                 self.send_json({"ok": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             elif path == "/api/restart":
@@ -2479,6 +2633,7 @@ def main() -> None:
         server.serve_forever()
     finally:
         MEETING_BROWSER.shutdown()
+        MEETING_BRIDGE.shutdown()
         SERVICE.stop()
 
 

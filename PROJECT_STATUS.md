@@ -1,23 +1,27 @@
 # Project Status
 
-## 当前成果
+## 已完成
 
-- 腾讯会议单回放使用 AppData 独立浏览器 Profile；输入链接限制为官方 HTTPS `/cw/`、`/crm/` 路径。
-- 登录以腾讯网页账号状态接口的成功响应为依据；扫码二维码可见时必定视为未登录。扫码信号稳定后先关闭可见浏览器，再新建无头持久 Profile 验证，确认后才报告已登录。
-- 回放解析独立判断登录跳转、明确权限错误及录制页/播放器，不要求录制页出现首页头像。媒体 URL/请求头仍仅保存在内存，不写日志/配置。
-- 日志使用安全原因码记录登录信号、二维码状态、Profile 复核、解析阶段/访问分类、播放器与媒体候选数；不记完整回放链接、媒体地址、Cookie、Authorization、Token 或身份信息。
+- 新增 `browser-extension/` MV3 CourseFlow Meeting Bridge；本地任务、随机 bridge token 与敏感媒体请求上下文只保存在当前进程/扩展内存，任务结果在 30 分钟后过期。
+- CourseFlow 提供桥接状态、配对、heartbeat、串行领取、进度、结果及安全任务状态 API；严格限制腾讯会议 `/cw/`、`/crm/` URL，敏感媒体 URL/headers 不返回页面、不写日志或配置。
+- 扩展使用浏览器现有登录态，单次仅处理一个后台 `active:false` worker tab；媒体采集按 task/tab/navigation generation 隔离，捕获唯一 MP4 请求上下文后回传，并在成功/失败时关闭 tab、清理内存。
+- 腾讯会议页面改走 bridge，未连接时禁用解析；设置页显示插件状态。旧 Playwright 路线保留但已停用为默认 UI 流程。
+- README 已改为桥接插件方案；B站下载和转写未改。
 
-## 本轮自动验证
+## 验证
 
-- 新增 `tests/test_meeting_browser.py` 回归测试，11 项通过：二维码否决登录、泛化 user-info 无效、接口信号、扫码后新 Profile 复核失败、回放无头像、明确登录跳转、URL 白名单及日志脱敏。
-- 对腾讯公开登录页进行隔离浏览器实测：未登录账号接口返回未认证结果；登录二维码连续可见 15 秒，期间认证判断始终为否。
-- 本地页面/API smoke test、Python 编译、`node --check`（app.js/asr.js）及 `git diff --check` 通过；B 站/转写代码路径未修改。
+- Python 编译及 `python -m unittest discover -s tests -v`：23 项通过；桥接 Node 测试：9 项通过；前后端 `node --check` 与 `git diff --check` 通过。
+- 本地 API smoke test 通过：正确扩展来源/token、CORS 预检、heartbeat、单次 claim、阶段更新及结果回传；错误来源/token 被拒绝，页面状态不含媒体 URL/Cookie；测试日志未发现媒体签名/凭据标记。
+- 隔离 Chrome 页面运行 CourseFlow：无 JavaScript 页面异常，未连接扩展时解析按钮保持禁用并显示未连接提示。
+- Playwright headless 环境未能加载扩展，因此未把模拟 worker 测试当作真实扩展验收。
 
-## 等待用户真实回归
+## 未完成
 
-- 真实微信扫码、扫码后新 Profile 认证成功、退出并重启后的持久登录，以及用户有权访问的回放页面访问尚未验证；不将模拟测试表述为真实登录成功。
-- 请在设置里退出旧腾讯会议 Profile，再扫码并等待 15 秒确认窗口不会自行关闭；随后完成扫码、重启工具，并测试一条有权限的 `/cw/` 回放。
+- 尚未用用户真实登录的 Chrome/Edge 和有权限回放验证扩展实际加载、后台 tab、真实 MP4 捕获、回传及 tab 关闭；本阶段未下载媒体。
+- 当前媒体 host 权限限于腾讯相关域名；真实回放若使用其它 CDN，需根据实际请求补充最小域名权限。
+- `meeting_browser.py` 旧 Playwright 实现仍保留，等待后续清理。
 
-## 未实现
+## 下一步
 
-- 腾讯会议下载、转写和批量导入仍未接入。
+- 在 `chrome://extensions` 或 `edge://extensions` 打开开发者模式，加载仓库 `browser-extension/`；先在该浏览器正常登录腾讯会议，再从 CourseFlow 检查插件并解析一条有权限的回放。
+- 只验收到页面显示解析成功、课程标题和“已找到视频资源”，确认后台 tab 关闭后停止；不测试下载/转写。
