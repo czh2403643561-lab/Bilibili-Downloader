@@ -289,7 +289,7 @@ async function logout() { try { renderLoginStatus(await api('/api/login/logout',
 
 function renderTranscriptionSettings() {
   const settings = state.transcription;
-  $('#transcription-provider').value = settings.provider || 'local';
+  $('#transcription-provider').value = settings.provider === 'mimo-v2.5-asr' ? 'mimo-v2.6-flash' : (settings.provider || 'local');
   const cloud = settings.provider !== 'local';
   $('#mimo-key-row').classList.toggle('hidden', !cloud);
   $('#mimo-key-status').textContent = settings.mimo_api_key_configured ? `已配置（${settings.mimo_api_key_hint}）` : '未配置';
@@ -454,7 +454,29 @@ async function clearTranscriptionHistory() {
   } catch (error) { asrMessage(error.message); }
 }
 
-function setupNavigation() { document.querySelectorAll('.nav-button').forEach((button) => button.addEventListener('click', () => { document.querySelectorAll('.nav-button').forEach((item) => item.classList.remove('active')); document.querySelectorAll('.page').forEach((item) => item.classList.add('hidden')); button.classList.add('active'); $(`#page-${button.dataset.page}`).classList.remove('hidden'); $('#page-title').textContent = ({ single: '单视频下载', up: 'UP 主批量下载', asr: '本地 AI 转写', settings: '设置' }[button.dataset.page]); if (button.dataset.page === 'asr') checkAsrHealth(); })); }
+function setupNavigation() {
+  const pageDetails = {
+    bilibili: ['B站课程', '解析公开视频、UP 主投稿，并可直接下载视频、音频或送入转写中心。'],
+    meeting: ['腾讯会议回放', '处理你有权限访问的课程回放。'],
+    asr: ['转写中心', '统一管理来自 B 站、腾讯会议和本地文件的转写任务。'],
+    settings: ['设置', '管理存储位置、账号和 AI 转写服务。'],
+  };
+  document.querySelectorAll('.nav-button[data-page]').forEach((button) => button.addEventListener('click', () => {
+    document.querySelectorAll('.nav-button[data-page]').forEach((item) => item.classList.remove('active'));
+    document.querySelectorAll('.page').forEach((item) => item.classList.add('hidden'));
+    button.classList.add('active');
+    $(`#page-${button.dataset.page}`).classList.remove('hidden');
+    const [title, description] = pageDetails[button.dataset.page] || pageDetails.bilibili;
+    $('#page-title').textContent = title;
+    $('#page-description').textContent = description;
+    if (button.dataset.page === 'asr') checkAsrHealth();
+  }));
+  document.querySelectorAll('.section-nav-button[data-subpage]').forEach((button) => button.addEventListener('click', () => {
+    const page = button.closest('.page');
+    button.closest('.section-nav').querySelectorAll('.section-nav-button').forEach((item) => item.classList.toggle('active', item === button));
+    page.querySelectorAll(':scope > .subpage').forEach((panel) => panel.classList.toggle('hidden', panel.id !== `page-${button.dataset.subpage}`));
+  }));
+}
 function bindEvents() {
   $('#parse-button').addEventListener('click', parseVideo); $('#video-url').addEventListener('keydown', (event) => { if (event.key === 'Enter') parseVideo(); });
   $('#select-all').addEventListener('click', () => document.querySelectorAll('#page-list input').forEach((input) => input.checked = true));
