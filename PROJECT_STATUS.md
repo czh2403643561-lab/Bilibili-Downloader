@@ -3,17 +3,15 @@
 ## 当前成果
 
 - CourseFlow 提供 B 站公开视频解析与下载、UP 主投稿批量浏览、本地或 MiMo 转写，以及腾讯会议回放解析桥接。
-- B 站扫码二维码故障已修复：运行日志显示 `qrcode` 未安装时接口返回 500；pip 的 SOCKS 代理缺少支持时返回 400；依赖安装后还需刷新 Python 导入缓存。二维码依赖现与腾讯会议 Playwright 隔离，并在扫码接口响应前验证生成成功。
-- 二维码图片接口不再把 B 站登录 URL 放进查询参数；每次生成使用独立缓存标记，图片失败会提示重新生成。扫码轮询逻辑保持不变。
-- 腾讯会议桥接目前暂停，本轮未修改腾讯会议代码。
+- B 站自动转写按 provider 检查依赖：只有 local 在获取音频前检查 FunASR；MiMo 跳过本地 ASR，继续音频下载、MiMo 队列和云端转写流程。
+- B 站二维码显示故障已修复；二维码依赖独立于腾讯会议 Playwright。腾讯会议桥接目前暂停，本轮未修改相关代码。
 
 ## 验证
 
-- `python -m py_compile app.py`、`node --check static/app.js`、`git diff --check` 通过。
-- `python -m unittest discover -s tests -v`：39 项通过，含假数据的扫码生成、二维码接口、失败提示和轮询测试；未调用真实 B 站扫码接口。
-- 使用隔离临时目录安装二维码依赖并实际生成 SVG 成功；B 站页面、UP 主批量页和转写中心可打开。
-- 尚待用户重启工具后进行真实 B 站扫码验收。
+- `python -m unittest discover -s tests -v`：41 项通过，新增 MiMo 本地 ASR 离线及 local 健康检查回归测试。
+- `python -m py_compile app.py` 与 `git diff --check` 通过。
+- 新增测试使用假下载与假云端转写，不调用真实 MiMo API；真实云端端到端验收待进行。
 
 ## 下一步
 
-- 重启 CourseFlow，在“设置 → B站账号”点击扫码登录；确认二维码显示，扫码后状态正常更新。
+- 使用 MiMo-V2.6-Flash 完成一次真实 B 站转写，确认云端结果正常；之前的 B 站扫码真实验收也仍待用户确认。

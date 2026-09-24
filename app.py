@@ -1418,13 +1418,15 @@ def run_transcription_pipeline(task_id: str, source: dict) -> None:
     service = BBDownService()
     service.respect_config = False
     with TRANSCRIPTION_LOCK:
+        provider = str(TRANSCRIPTION_TASKS.get(task_id, {}).get("provider") or "local")
         TRANSCRIPTION_SERVICES[task_id] = service
     try:
         check_transcription_cancelled(task_id)
         update_transcription(task_id, status="downloading", stage="正在获取音频", progress=5)
-        status, health = asr_json("/health")
-        if status != HTTPStatus.OK or not isinstance(health, dict) or health.get("ready") is not True:
-            raise RuntimeError(asr_error_message(health, "本地转写服务未就绪，无法开始自动转写。"))
+        if provider == "local":
+            status, health = asr_json("/health")
+            if status != HTTPStatus.OK or not isinstance(health, dict) or health.get("ready") is not True:
+                raise RuntimeError(asr_error_message(health, "本地转写服务未就绪，无法开始自动转写。"))
         temp_dir.mkdir(parents=True, exist_ok=True)
         ok, message = service.ensure_started(str(temp_dir), respect_config=False)
         if not ok:
