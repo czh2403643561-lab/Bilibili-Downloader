@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import hashlib
 import json
 import logging
 import os
@@ -19,6 +18,8 @@ import webbrowser
 import zipfile
 from pathlib import Path
 
+from build_info import BUILD_FILES, current_build_id as shared_current_build_id
+
 
 APP_NAME = "Bilibili Downloader"
 ROOT = Path(__file__).resolve().parent
@@ -27,7 +28,6 @@ LOG_DIR = APP_DATA / "logs"
 LAUNCHER_LOG = LOG_DIR / "launcher.log"
 APP_PORT = 23666
 APP_ID = "BilibiliDownloader"
-BUILD_FILES = ("app.py", "启动工具.pyw", "static/index.html", "static/app.js", "static/styles.css")
 BBDOWN = ROOT / "tools" / "BBDownNext" / "BBDown.exe"
 FFMPEG = ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
 BBDOWN_URL = "https://github.com/KaiHuaDou/BBDownNext/releases/download/v2.2.0/BBDown-win-x64.exe"
@@ -36,12 +36,7 @@ LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def current_build_id() -> str:
-    digest = hashlib.sha256()
-    for relative in BUILD_FILES:
-        path = ROOT / relative
-        digest.update(relative.encode("utf-8"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()[:16]
+    return shared_current_build_id(ROOT)
 
 
 BUILD_ID = current_build_id()
@@ -230,16 +225,20 @@ def start_app() -> None:
 
     instance_id = uuid.uuid4().hex
     command = [sys.executable, str(ROOT / "app.py"), "--instance-id", instance_id]
-    log("启动 app.py")
-    process = subprocess.Popen(
-        command,
-        cwd=ROOT,
-        creationflags=hidden_flags(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-    )
+    startup_log = LOG_DIR / "app-startup.log"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log(f"启动 app.py，启动日志：{startup_log}")
+    with startup_log.open("ab") as startup_stream:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            creationflags=hidden_flags(),
+            stdin=subprocess.DEVNULL,
+            stdout=startup_stream,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
     for _ in range(120):
         time.sleep(0.25)
         current = health()
@@ -248,8 +247,17 @@ def start_app() -> None:
             webbrowser.open(f"http://127.0.0.1:{APP_PORT}/")
             return
         if process.poll() is not None:
-            raise RuntimeError("app.py 启动失败，请查看 launcher.log。")
-    raise RuntimeError("本地服务启动超时，请查看 launcher.log。")
+            log(f"app.py 已退出，returncode={process.returncode}；启动日志：{startup_log}")
+            raise RuntimeError("app.py 启动失败，请查看 launcher.log 和 app-startup.log。")
+    returncode = process.poll()
+    log(f"app.py 启动超时，returncode={returncode}；启动日志：{startup_log}")
+    if returncode is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    raise RuntimeError("本地服务启动超时，请查看 launcher.log 和 app-startup.log。")
 
 
 def main() -> None:

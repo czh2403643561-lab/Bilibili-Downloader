@@ -30,6 +30,8 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from build_info import BUILD_FILES, current_build_id as shared_current_build_id
+
 APP_NAME = "BilibiliDownloader"
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
@@ -44,7 +46,6 @@ LOG_DIR = APP_DATA / "logs"
 APP_PORT = 23666
 LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ALLOWED_COVER_SUFFIX = ".hdslb.com"
-BUILD_FILES = ("app.py", "启动工具.pyw", "static/index.html", "static/app.js", "static/asr.js", "static/styles.css")
 BILIBILI_SPACE_API = "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space"
 BILIBILI_ARC_SEARCH_API = "https://api.bilibili.com/x/space/wbi/arc/search"
 BILIBILI_LEGACY_ARC_SEARCH_API = "https://api.bilibili.com/x/space/arc/search"
@@ -94,12 +95,7 @@ LOG = logging.getLogger(APP_NAME)
 
 
 def current_build_id() -> str:
-    digest = hashlib.sha256()
-    for relative in BUILD_FILES:
-        path = ROOT / relative
-        digest.update(relative.encode("utf-8"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()[:16]
+    return shared_current_build_id(ROOT)
 
 
 BUILD_ID = current_build_id()

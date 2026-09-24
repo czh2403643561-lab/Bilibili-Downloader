@@ -9,7 +9,7 @@ DATA_ROOT = Path(os.getenv("ASR_DATA_DIR", str(PROJECT_ROOT / "data"))).resolve(
 JOBS_ROOT = DATA_ROOT / "jobs"
 DB_PATH = Path(os.getenv("ASR_DB_PATH", str(DATA_ROOT / "asr_jobs.sqlite3"))).resolve()
 
-ASR_MODEL = os.getenv("ASR_MODEL", "paraformer-zh")
+ASR_MODEL = os.getenv("ASR_MODEL", "SeacoParaformer")
 ASR_MODEL_ID = os.getenv(
     "ASR_MODEL_ID",
     "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
@@ -47,6 +47,15 @@ ALLOWED_EXTENSIONS = {
 def cors_origins() -> list[str]:
     value = os.getenv(
         "ASR_CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+        "http://localhost:23666,http://127.0.0.1:23666",
     )
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def cached_model_source(model_id: str) -> str:
+    """优先使用已存在的 ModelScope 快照，避免本机代理配置影响启动。"""
+    cache_root = Path(
+        os.getenv("MODELSCOPE_CACHE", str(Path.home() / ".cache" / "modelscope" / "models"))
+    )
+    snapshot = cache_root / model_id.replace("/", "--") / "snapshots" / "master"
+    return str(snapshot) if snapshot.is_dir() else model_id

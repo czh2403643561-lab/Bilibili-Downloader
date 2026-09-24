@@ -259,7 +259,18 @@ function renderAsr() {
   healthEl.textContent = health?.message || '检查中'; healthEl.classList.toggle('ready', Boolean(health?.available)); healthEl.classList.toggle('problem', health?.mode === 'offline');
   const info = $('#asr-file-info'); info.classList.toggle('hidden', !asr.file); if (asr.file) info.textContent = `${asr.file.name} · ${formatFileSize(asr.file.size)}${Number.isFinite(asr.duration) ? ` · ${formatAsrTime(asr.duration * 1000)}` : ''}`;
   $('#asr-start').disabled = !asr.file || !health?.available || Boolean(asr.job && !['failed', 'cancelled', 'succeeded'].includes(asr.job.status)); $('#asr-new-file').classList.toggle('hidden', !asr.file);
-  const job = asr.job; $('#asr-status-card').classList.toggle('hidden', !job); if (job) { const key = job.phase || job.status; const copy = ASR_STATUS[key] || ['转写状态未知', '']; $('#asr-status-title').textContent = copy[0]; $('#asr-status-detail').textContent = copy[1]; $('#asr-cancel').classList.toggle('hidden', !['queued', 'processing'].includes(job.status)); document.querySelectorAll('[data-asr-step]').forEach((step) => { const order = ['preparing', 'uploading', 'queued', 'processing', 'succeeded']; const activeIndex = order.indexOf(key); const ownIndex = order.indexOf(step.dataset.asrStep); step.classList.toggle('active', ownIndex <= activeIndex && key !== 'failed' && key !== 'cancelled'); }); }
+  const job = asr.job; $('#asr-status-card').classList.toggle('hidden', !job); if (job) {
+    const key = job.phase || job.status; const copy = ASR_STATUS[key] || ['转写状态未知', ''];
+    const errorText = typeof job.error === 'string' ? job.error : job.error?.message;
+    const hasRealProgress = health?.mode === 'service' && Number.isFinite(job.progress);
+    $('#asr-status-title').textContent = copy[0];
+    $('#asr-status-detail').textContent = errorText || (hasRealProgress ? `${copy[1]} · 进度：${job.progress}%` : copy[1]);
+    $('#asr-cancel').classList.toggle('hidden', !['queued', 'processing'].includes(job.status));
+    $('#asr-progress').classList.toggle('hidden', !hasRealProgress);
+    $('#asr-progress-text').classList.toggle('hidden', !hasRealProgress);
+    if (hasRealProgress) { $('#asr-progress-fill').style.width = `${job.progress}%`; $('#asr-progress-text').textContent = `已完成 ${job.progress}%`; }
+    document.querySelectorAll('[data-asr-step]').forEach((step) => { const order = ['preparing', 'uploading', 'queued', 'processing', 'succeeded']; const activeIndex = order.indexOf(key); const ownIndex = order.indexOf(step.dataset.asrStep); step.classList.toggle('active', ownIndex <= activeIndex && key !== 'failed' && key !== 'cancelled'); });
+  } else { $('#asr-progress').classList.add('hidden'); $('#asr-progress-text').classList.add('hidden'); }
   $('#asr-result').classList.toggle('hidden', !asr.result); if (!asr.result) return;
   $('#asr-result-meta').textContent = health?.mode === 'mock' ? '模拟模式结果 / 等待真实 ASR 服务' : '本地转写结果'; $('#asr-text').textContent = asr.result.text;
   const timeline = $('#asr-timeline'); timeline.innerHTML = asr.result.segments.map((segment) => `<article class="asr-segment"><time>${formatAsrTime(segment.start_ms)}</time><div>${segment.speaker ? `<strong>${escapeHtml(segment.speaker)}</strong>` : ''}<p>${escapeHtml(segment.text)}</p></div></article>`).join('');
@@ -276,8 +287,8 @@ async function setAsrFile(file) {
 }
 function stopAsrPolling() { if (state.asr.polling) clearInterval(state.asr.polling); state.asr.polling = null; }
 async function pollAsrJob() { const job = state.asr.job; if (!job) return; try { state.asr.job = await AsrClient.getJob(job.task_id); if (state.asr.job.status === 'succeeded') { state.asr.result = await AsrClient.getJobResult(job.task_id); stopAsrPolling(); } if (['failed', 'cancelled'].includes(state.asr.job.status)) stopAsrPolling(); } catch (error) { state.asr.job = { ...job, status: 'failed', error: error.message }; stopAsrPolling(); asrMessage('转写服务暂时不可用。'); } renderAsr(); }
-async function startAsr() { if (!state.asr.file) { asrMessage('请先选择本地音频文件。'); return; } asrMessage(''); try { state.asr.job = await AsrClient.createTranscriptionJob({ type: 'local_file', file: state.asr.file }); state.asr.result = null; renderAsr(); stopAsrPolling(); state.asr.polling = setInterval(pollAsrJob, 350); await pollAsrJob(); } catch (error) { asrMessage(error.message); renderAsr(); } }
-async function cancelAsr() { if (!state.asr.job) return; try { state.asr.job = await AsrClient.cancelJob(state.asr.job.task_id); stopAsrPolling(); } catch (error) { asrMessage(error.message); } renderAsr(); }
+async function startAsr() { if (!state.asr.file) { asrMessage('请先选择本地音频文件。'); return; } asrMessage(''); try { state.asr.job = await AsrClient.createTranscriptionJob({ type: 'local_file', file: state.asr.file }); state.asr.result = null; renderAsr(); stopAsrPolling(); state.asr.polling = setInterval(pollAsrJob, 1000); await pollAsrJob(); } catch (error) { asrMessage(error.message); renderAsr(); } }
+async function cancelAsr() { if (!state.asr.job) return; try { state.asr.job = await AsrClient.cancelJob(state.asr.job.task_id); stopAsrPolling(); } catch (error) { if (error.status === 409) asrMessage('任务已开始转写，当前不能中断。'); else asrMessage(error.message); } renderAsr(); }
 async function copyAsrText() { try { await navigator.clipboard.writeText(state.asr.result?.text || ''); asrMessage('全文已复制。'); } catch (_) { asrMessage('无法自动复制，请手动选择文字稿。'); } }
 function exportAsr(kind) { try { const text = AsrClient.exportText(state.asr.result, kind); const blob = new Blob([text], { type: kind === 'txt' ? 'text/plain;charset=utf-8' : 'text/plain;charset=utf-8' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `${asrFileName()}.${kind}`; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 0); } catch (error) { asrMessage(error.message); } }
 

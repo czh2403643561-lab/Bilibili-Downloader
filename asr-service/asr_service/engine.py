@@ -31,9 +31,9 @@ class FunASREngine:
             raise RuntimeError("CUDA 不可用，服务不会回退到 CPU。")
         torch.cuda.set_device(0)
         self.model = AutoModel(
-            model=config.ASR_MODEL,
-            vad_model=config.VAD_MODEL,
-            punc_model=config.PUNC_MODEL,
+            model=config.cached_model_source(config.ASR_MODEL_ID),
+            vad_model=config.cached_model_source(config.VAD_MODEL_ID),
+            punc_model=config.cached_model_source(config.PUNC_MODEL_ID),
             device=config.DEVICE,
             disable_update=True,
         )
