@@ -19,9 +19,16 @@
 
 ## 未完成
 
-- 真实 ASR 服务、上传 body 与最终端口尚未提供，因此未接入模型或推理服务；本仓库不会加载 FunASR、Paraformer、CUDA 或模型文件。
-- 本轮未用真实音频提交至真实 ASR 服务；未来接入时需按服务契约实现上传 Adapter，并回归现有文字稿 UI。
+- 真实 ASR 服务已独立并入 `asr-service/`，本仓库客户端仍不直接加载 FunASR、Paraformer、CUDA 或模型文件。
+- 已用真实本地音频验证服务 API；客户端尚未完成真实上传 Adapter 联调，后续需回归现有文字稿 UI。
 
 ## 下一步
 
-- 等待独立 ASR 服务提供 Base URL、认证方式（如有）和 POST `/v1/jobs` 的请求/响应规范后接入真实 Adapter。
+- 按 `docs/ASR_HANDOFF.md` 的 Base URL 和 POST `/v1/jobs` 契约接入真实 Adapter，并回归现有文字稿 UI。
+
+## ASR 模块
+
+- ASR 服务代码已并入独立目录 `asr-service/`，不加载到 B 站下载器的 `app.py` 或 `static/`。
+- 当前 API 已支持本地异步上传、SQLite 任务状态、单 GPU 队列、Paraformer 中文 ASR、FSMN-VAD、标点、时间戳、句段和官方热词字段。
+- 当前模型为 FunASR `1.4.16` + Paraformer/VAD/标点模型，已在 RTX 5060 GPU 上完成真实课程音频测试；当前没有 Speaker 模型。
+- ASR 服务可以独立启动和调用；尚未完成与 Bilibili Downloader 客户端的真实音频联调。

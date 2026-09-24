@@ -2,3 +2,26 @@ __pycache__/
 *.py[cod]
 tools/BBDownNext/*.exe
 tools/ffmpeg/
+
+# Local ASR runtime data, models, caches, logs and environments
+asr-service/data/
+asr-service/models/
+asr-service/cache/
+asr-service/logs/
+asr-service/tmp/
+asr-service/.venv/
+asr-service/venv/
+asr-service/*.log
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.mp3
+*.wav
+*.m4a
+*.flac
