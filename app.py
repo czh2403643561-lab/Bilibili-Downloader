@@ -688,13 +688,21 @@ def mimo_response_metadata(payload: object) -> dict[str, object]:
     }
 
 
-def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model: str) -> dict:
+def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model: str, progress_callback=None) -> dict:
     api_key = load_mimo_api_key()
     if not api_key:
         raise RuntimeError("当前已选择 MiMo，但尚未配置 API Key。请到“设置”中保存并测试。")
+    if progress_callback:
+        progress_callback(10, "正在准备音频")
     chunks = mimo_audio_chunks(audio_path, temp_dir, provider)
+    if not chunks:
+        raise RuntimeError("音频准备失败：没有生成可转写的音频片段。")
+    if progress_callback:
+        progress_callback(15, f"音频准备完成，共 {len(chunks)} 段")
     texts = []
     for index, chunk in enumerate(chunks, 1):
+        if progress_callback:
+            progress_callback(20 + round(70 * (index - 1) / len(chunks)), f"正在转写第 {index}/{len(chunks)} 段")
         encoded = base64.b64encode(chunk.read_bytes()).decode("ascii")
         mime = mimetypes.guess_type(chunk.name)[0] or "audio/mpeg"
         audio_data = f"data:{mime};base64,{encoded}"
@@ -751,6 +759,10 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
             texts.append(text)
         except Exception as error:
             raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 个音频片段失败：{short_error(error)}") from error
+        if progress_callback:
+            progress_callback(20 + round(70 * index / len(chunks)), f"已完成第 {index}/{len(chunks)} 段")
+    if progress_callback:
+        progress_callback(95, "正在整理文字稿")
     return {
         "api_version": "mimo-openai-compatible",
         "task_id": "",
@@ -1127,8 +1139,8 @@ def run_transcription_audio(task_id: str, audio_path: Path) -> None:
         run_local_transcription_audio(task_id, audio_path)
         return
     try:
-        update_transcription(task_id, status="processing", stage="正在请求 MiMo", progress=40)
-        result = mimo_transcribe_audio(audio_path, audio_path.parent / "mimo", provider, model)
+        progress_callback = lambda progress, stage: update_transcription(task_id, status="processing", stage=stage, progress=progress)
+        result = mimo_transcribe_audio(audio_path, audio_path.parent / "mimo", provider, model, progress_callback)
         update_transcription(task_id, status="succeeded", stage="转写完成", progress=100, result=result, finished_at=datetime.now().isoformat(timespec="seconds"))
     except Exception as error:
         update_transcription(task_id, status="failed", stage="转写失败", progress=0, error=short_error(error), finished_at=datetime.now().isoformat(timespec="seconds"))

@@ -314,6 +314,7 @@ const ASR_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 const ASR_STATUS = { preparing: ['正在准备音频', '正在整理本地音频。'], uploading: ['正在上传', '正在发送至你的本机转写服务。'], queued: ['排队中', '等待本机转写服务处理。'], processing: ['正在转写', '正在由本机转写服务处理。'], succeeded: ['转写完成', '文字稿已准备完成。'], failed: ['转写失败', '本次转写没有完成。'], cancelled: ['已取消', '转写任务已取消。'] };
 function asrFileName() { return state.asr.file?.name?.replace(/\.[^.]+$/, '') || '文字稿'; }
 function formatFileSize(bytes) { if (!Number.isFinite(bytes)) return '大小未知'; if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`; return `${(bytes / 1024 / 1024).toFixed(bytes >= 100 * 1024 * 1024 ? 0 : 1)} MB`; }
+function formatAsrDuration(seconds) { const total = Math.max(0, Math.floor(seconds)); const hours = Math.floor(total / 3600); const minutes = Math.floor((total % 3600) / 60); const remainder = total % 60; return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}` : `${minutes}:${String(remainder).padStart(2, '0')}`; }
 function asrMessage(value = '') { $('#asr-message').textContent = value; }
 const AUTO_ASR_STATUS = { downloading: '获取音频中', uploading: '提交转写中', queued: '排队中', processing: '正在转写', succeeded: '已完成', failed: '失败', cancelled: '已取消' };
 const ASR_ACTIVE_STATUSES = new Set(['queued', 'downloading', 'uploading', 'processing']);
@@ -338,7 +339,7 @@ function renderAsr() {
   const asr = state.asr; const health = asr.health; const healthEl = $('#asr-health');
   healthEl.textContent = health?.message || '检查中'; healthEl.classList.toggle('ready', Boolean(health?.available)); healthEl.classList.toggle('problem', health?.mode === 'offline');
   renderAutomaticTasks();
-  const info = $('#asr-file-info'); info.classList.toggle('hidden', !asr.file); if (asr.file) info.textContent = `${asr.file.name} · ${formatFileSize(asr.file.size)}${Number.isFinite(asr.duration) ? ` · ${formatAsrTime(asr.duration * 1000)}` : ''}`;
+  const info = $('#asr-file-info'); info.classList.toggle('hidden', !asr.file); if (asr.file) info.textContent = `${asr.file.name} · ${formatFileSize(asr.file.size)}${Number.isFinite(asr.duration) ? ` · ${formatAsrDuration(asr.duration)}` : ''}`;
   $('#asr-start').disabled = !asr.file || !health?.available || Boolean(asr.job && !['failed', 'cancelled', 'succeeded'].includes(asr.job.status)); $('#asr-new-file').classList.toggle('hidden', !asr.file);
   const automatic = activeAutomaticTask(); const job = automatic || asr.job; $('#asr-status-card').classList.toggle('hidden', !job); if (job) {
     const key = job.phase || job.status; const copy = ASR_STATUS[key] || ['转写状态未知', ''];
@@ -355,7 +356,7 @@ function renderAsr() {
   } else { $('#asr-progress').classList.add('hidden'); $('#asr-progress-text').classList.add('hidden'); }
   const result = currentAsrResult(); $('#asr-result').classList.toggle('hidden', !result); if (!result) return;
   const modelLabel = automatic ? (automatic.provider === 'local' ? '本地 FunASR' : automatic.model) : (health?.mode === 'mock' ? '模拟模式' : '本地 FunASR');
-  $('#asr-result-meta').textContent = `${modelLabel} · ${automatic?.name || automatic?.filename || asrFileName()}`; $('#asr-text').textContent = result.text || '';
+  $('#asr-result-meta').textContent = `${modelLabel} · ${automatic?.name || automatic?.filename || asrFileName()}`; $('#asr-text').textContent = result.text?.trim() || '该任务已完成，但没有可显示的文字稿。';
 }
 async function checkAsrHealth() {
   if (state.transcription.provider === 'local') {
