@@ -555,7 +555,23 @@ def public_transcription_settings() -> dict:
     }
 
 
-def mimo_request(path: str, api_key: str, payload: dict | None = None, method: str = "POST") -> tuple[int, object]:
+def mimo_request(
+    path: str,
+    api_key: str,
+    payload: dict | None = None,
+    method: str = "POST",
+    *,
+    task_id: str = "",
+    provider: str = "",
+    model: str = "",
+    chunk_index: int = 0,
+    chunk_total: int = 0,
+    chunk_bytes: int = 0,
+    cancellation_check=None,
+    cancel_event: threading.Event | None = None,
+    request_lock: threading.Lock | None = None,
+    attempt_callback=None,
+) -> tuple[int, object]:
     if not api_key:
         raise RuntimeError("尚未配置 MiMo API Key。")
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if payload is not None else None
@@ -565,14 +581,36 @@ def mimo_request(path: str, api_key: str, payload: dict | None = None, method: s
     retryable = {429, 500, 502, 503, 504}
     last_error = "MiMo API 请求失败。"
     for attempt in range(4):
-        request = urllib.request.Request(f"{MIMO_BASE_URL}{path}", body, method=method, headers=headers)
+        if cancellation_check:
+            cancellation_check()
+        if attempt_callback:
+            attempt_callback(attempt + 1)
+        if request_lock:
+            request_lock.acquire()
+        try:
+            if cancellation_check:
+                cancellation_check()
+            started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            started_clock = time.monotonic()
+            request = urllib.request.Request(f"{MIMO_BASE_URL}{path}", body, method=method, headers=headers)
+        finally:
+            if request_lock:
+                request_lock.release()
         try:
             with LOCAL_OPENER.open(request, timeout=120) as response:
                 raw = response.read()
                 try:
-                    return response.status, json.loads(raw.decode("utf-8")) if raw else {}
+                    result = json.loads(raw.decode("utf-8")) if raw else {}
                 except json.JSONDecodeError:
-                    return response.status, {}
+                    result = {}
+                metadata = mimo_response_metadata(result)
+                if task_id:
+                    LOG.info(
+                        "MiMo request task_id=%s provider=%s model=%s chunk=%s/%s bytes=%s attempt=%s started_at=%s duration_s=%.3f status=%s will_retry=false retry_reason=none finish_reason=%s usage=%s content_chars=%s",
+                        task_id, provider, model, chunk_index, chunk_total, chunk_bytes, attempt + 1, started_at,
+                        time.monotonic() - started_clock, response.status, metadata["finish_reason"], metadata["usage"], metadata["content_chars"],
+                    )
+                return response.status, result
         except urllib.error.HTTPError as error:
             raw = error.read()
             try:
@@ -580,13 +618,38 @@ def mimo_request(path: str, api_key: str, payload: dict | None = None, method: s
             except json.JSONDecodeError:
                 result = {}
             last_error = asr_error_message(result, f"MiMo API 请求失败（HTTP {error.code}）。")
-            if error.code not in retryable or attempt == 3:
+            will_retry = error.code in retryable and attempt < 3
+            retry_reason = "429" if error.code == 429 else "5xx" if 500 <= error.code <= 599 else "none"
+            metadata = mimo_response_metadata(result)
+            if task_id:
+                LOG.warning(
+                    "MiMo request task_id=%s provider=%s model=%s chunk=%s/%s bytes=%s attempt=%s started_at=%s duration_s=%.3f status=%s will_retry=%s retry_reason=%s finish_reason=%s usage=%s content_chars=%s",
+                    task_id, provider, model, chunk_index, chunk_total, chunk_bytes, attempt + 1, started_at,
+                    time.monotonic() - started_clock, error.code, str(will_retry).lower(), retry_reason,
+                    metadata["finish_reason"], metadata["usage"], metadata["content_chars"],
+                )
+            if not will_retry:
                 raise RuntimeError(last_error)
-        except urllib.error.URLError as error:
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError) as error:
             last_error = "MiMo API 网络请求失败，请检查网络连接。"
+            reason = error.reason if isinstance(error, urllib.error.URLError) else error
+            timed_out = isinstance(reason, (TimeoutError, socket.timeout))
+            will_retry = attempt < 3
+            retry_reason = "timeout" if timed_out else "network"
+            if task_id:
+                LOG.warning(
+                    "MiMo request task_id=%s provider=%s model=%s chunk=%s/%s bytes=%s attempt=%s started_at=%s duration_s=%.3f status=none will_retry=%s retry_reason=%s finish_reason=none usage={} content_chars=0",
+                    task_id, provider, model, chunk_index, chunk_total, chunk_bytes, attempt + 1, started_at,
+                    time.monotonic() - started_clock, str(will_retry).lower(), retry_reason,
+                )
             if attempt == 3:
                 raise RuntimeError(last_error) from error
-        time.sleep(0.8 * (2 ** attempt))
+        delay = 0.8 * (2 ** attempt)
+        if cancel_event:
+            if cancel_event.wait(delay) and cancellation_check:
+                cancellation_check()
+        else:
+            time.sleep(delay)
     raise RuntimeError(last_error)
 
 
@@ -688,7 +751,7 @@ def mimo_response_metadata(payload: object) -> dict[str, object]:
     }
 
 
-def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model: str, progress_callback=None) -> dict:
+def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model: str, progress_callback=None, task_id: str = "") -> dict:
     api_key = load_mimo_api_key()
     if not api_key:
         raise RuntimeError("当前已选择 MiMo，但尚未配置 API Key。请到“设置”中保存并测试。")
@@ -701,6 +764,7 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
         progress_callback(15, f"音频准备完成，共 {len(chunks)} 段")
     texts = []
     for index, chunk in enumerate(chunks, 1):
+        check_transcription_cancelled(task_id) if task_id else None
         if progress_callback:
             progress_callback(20 + round(70 * (index - 1) / len(chunks)), f"正在转写第 {index}/{len(chunks)} 段")
         encoded = base64.b64encode(chunk.read_bytes()).decode("ascii")
@@ -718,21 +782,24 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
                 "max_completion_tokens": 65536,
             }
         try:
-            status, response = mimo_request("/chat/completions", api_key, payload)
-            metadata = mimo_response_metadata(response)
-            LOG.info(
-                "MiMo response provider=%s model=%s chunk=%s/%s bytes=%s status=%s finish_reason=%s usage=%s content_chars=%s reasoning_content_chars=%s",
-                provider,
-                model,
-                index,
-                len(chunks),
-                chunk.stat().st_size,
-                status,
-                metadata["finish_reason"],
-                metadata["usage"],
-                metadata["content_chars"],
-                metadata["reasoning_content_chars"],
+            def report_attempt(attempt: int) -> None:
+                if task_id:
+                    check_transcription_cancelled(task_id)
+                if progress_callback:
+                    progress_callback(20 + round(70 * (index - 1) / len(chunks)), f"正在转写第 {index}/{len(chunks)} 段")
+                    update_transcription(task_id, status="processing", request_attempt=attempt)
+
+            status, response = mimo_request(
+                "/chat/completions", api_key, payload,
+                task_id=task_id, provider=provider, model=model, chunk_index=index, chunk_total=len(chunks),
+                chunk_bytes=chunk.stat().st_size,
+                cancellation_check=(lambda: check_transcription_cancelled(task_id)) if task_id else None,
+                cancel_event=TRANSCRIPTION_CANCEL_EVENTS.get(task_id) if task_id else None,
+                request_lock=TRANSCRIPTION_REQUEST_LOCKS.get(task_id) if task_id else None,
+                attempt_callback=report_attempt,
             )
+            check_transcription_cancelled(task_id) if task_id else None
+            metadata = mimo_response_metadata(response)
             if status < 200 or status >= 300:
                 raise RuntimeError(asr_error_message(response, f"MiMo 第 {index}/{len(chunks)} 个音频片段请求失败。"))
             finish_reason = metadata["finish_reason"]
@@ -757,6 +824,8 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
                 )
                 raise RuntimeError("MiMo 返回空文字稿。")
             texts.append(text)
+        except TranscriptionCancelled:
+            raise
         except Exception as error:
             raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 个音频片段失败：{short_error(error)}") from error
         if progress_callback:
@@ -781,9 +850,16 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
 TRANSCRIPTION_LOCK = threading.RLock()
 TRANSCRIPTION_TASKS: dict[str, dict] = {}
 TRANSCRIPTION_ACTIVE_STATUSES = {"queued", "downloading", "uploading", "processing"}
+TRANSCRIPTION_CANCEL_EVENTS: dict[str, threading.Event] = {}
+TRANSCRIPTION_REQUEST_LOCKS: dict[str, threading.Lock] = {}
+TRANSCRIPTION_SERVICES: dict[str, BBDownService] = {}
+MIMO_QUEUE_CONDITION = threading.Condition()
+MIMO_QUEUE: list[str] = []
+MIMO_ACTIVE_TASK_ID = ""
 TRANSCRIPTION_HISTORY_FIELDS = (
     "task_id", "name", "source_url", "source_title", "status", "stage", "progress", "error",
     "result", "filename", "created_at", "finished_at", "parent_id", "provider", "model",
+    "cancel_requested", "stage_started_at", "request_attempt", "asr_task_id", "download_task_id", "asr_cancel_sent", "queue_ahead",
 )
 ASR_SERVICE_HOST = "127.0.0.1"
 ASR_SERVICE_PORT = 8765
@@ -888,18 +964,21 @@ def load_transcription_history() -> None:
         if not isinstance(task, dict) or not re.fullmatch(r"[a-f0-9]{24}", str(task.get("task_id") or "")):
             continue
         if task.get("status") in TRANSCRIPTION_ACTIVE_STATUSES:
-            task.update(
-                status="failed",
-                stage="任务已中断",
-                progress=0,
-                error="程序关闭时任务仍在运行，已标记中断；请重新创建任务。",
-                finished_at=datetime.now().isoformat(timespec="seconds"),
-            )
+            if task.get("cancel_requested"):
+                task.update(status="cancelled", stage="已取消", finished_at=datetime.now().isoformat(timespec="seconds"))
+            else:
+                task.update(
+                    status="failed",
+                    stage="任务已中断",
+                    progress=0,
+                    error="程序关闭时任务仍在运行，已标记中断；请重新创建任务。",
+                    finished_at=datetime.now().isoformat(timespec="seconds"),
+                )
         recovered[task["task_id"]] = {key: task.get(key) for key in TRANSCRIPTION_HISTORY_FIELDS}
     with TRANSCRIPTION_LOCK:
         TRANSCRIPTION_TASKS.update(recovered)
         for task in recovered.values():
-            if task.get("stage") == "任务已中断":
+            if task.get("stage") == "任务已中断" or (task.get("status") == "cancelled" and task.get("cancel_requested")):
                 persist_transcription(task)
 
 
@@ -918,6 +997,17 @@ def update_transcription(task_id: str, **fields: object) -> dict | None:
         task = TRANSCRIPTION_TASKS.get(task_id)
         if task is None:
             return None
+        if task.get("cancel_requested") and fields.get("status") != "cancelled":
+            if fields.get("status") in {"succeeded", "failed"}:
+                fields = {
+                    "status": "cancelled",
+                    "stage": "已取消",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            else:
+                return dict(task)
+        if ("stage" in fields and fields["stage"] != task.get("stage")) or ("request_attempt" in fields and fields["request_attempt"] != task.get("request_attempt")):
+            fields.setdefault("stage_started_at", datetime.now().astimezone().isoformat(timespec="seconds"))
         task.update(fields)
         if isinstance(task.get("result"), dict):
             task["result"] = dict(task["result"])
@@ -926,11 +1016,145 @@ def update_transcription(task_id: str, **fields: object) -> dict | None:
         return dict(task)
 
 
-def new_transcription_task(source: dict, *, parent_id: str | None = None, filename: str = "") -> dict:
+class TranscriptionCancelled(Exception):
+    pass
+
+
+def transcription_cancel_requested(task_id: str) -> bool:
+    with TRANSCRIPTION_LOCK:
+        return bool(TRANSCRIPTION_TASKS.get(task_id, {}).get("cancel_requested"))
+
+
+def check_transcription_cancelled(task_id: str) -> None:
+    if transcription_cancel_requested(task_id):
+        raise TranscriptionCancelled("转写任务已取消。")
+
+
+def mark_transcription_cancelled(task_id: str) -> dict | None:
+    return update_transcription(
+        task_id,
+        status="cancelled",
+        stage="已取消",
+        finished_at=datetime.now().isoformat(timespec="seconds"),
+    )
+
+
+def refresh_mimo_queue_positions() -> None:
+    with MIMO_QUEUE_CONDITION:
+        queued = list(MIMO_QUEUE)
+        ahead_base = 1 if MIMO_ACTIVE_TASK_ID else 0
+    for index, task_id in enumerate(queued):
+        with TRANSCRIPTION_LOCK:
+            task = TRANSCRIPTION_TASKS.get(task_id)
+            old_ahead = task.get("queue_ahead") if task else None
+        ahead = ahead_base + index
+        if task and (old_ahead != ahead or task.get("status") != "queued"):
+            update_transcription(task_id, status="queued", stage=f"云端排队中 · 前方 {ahead} 个任务", queue_ahead=ahead)
+
+
+def acquire_mimo_queue(task_id: str) -> None:
+    global MIMO_ACTIVE_TASK_ID
+    with MIMO_QUEUE_CONDITION:
+        if task_id not in MIMO_QUEUE:
+            MIMO_QUEUE.append(task_id)
+            MIMO_QUEUE_CONDITION.notify_all()
+    refresh_mimo_queue_positions()
+    while True:
+        check_transcription_cancelled(task_id)
+        with MIMO_QUEUE_CONDITION:
+            if MIMO_ACTIVE_TASK_ID == "" and MIMO_QUEUE and MIMO_QUEUE[0] == task_id:
+                MIMO_QUEUE.pop(0)
+                MIMO_ACTIVE_TASK_ID = task_id
+                MIMO_QUEUE_CONDITION.notify_all()
+                acquired = True
+            else:
+                acquired = False
+                MIMO_QUEUE_CONDITION.wait(timeout=0.5)
+        if acquired:
+            refresh_mimo_queue_positions()
+            return
+
+
+def release_mimo_queue(task_id: str) -> None:
+    global MIMO_ACTIVE_TASK_ID
+    with MIMO_QUEUE_CONDITION:
+        if MIMO_ACTIVE_TASK_ID == task_id:
+            MIMO_ACTIVE_TASK_ID = ""
+        if task_id in MIMO_QUEUE:
+            MIMO_QUEUE.remove(task_id)
+        MIMO_QUEUE_CONDITION.notify_all()
+    refresh_mimo_queue_positions()
+
+
+def cancel_transcription(task_id: str) -> dict:
+    with TRANSCRIPTION_LOCK:
+        task = TRANSCRIPTION_TASKS.get(task_id)
+        if task is None:
+            raise KeyError("没有找到这个转写任务。")
+        if task.get("status") not in TRANSCRIPTION_ACTIVE_STATUSES:
+            raise ValueError("这个转写任务已经结束。")
+        request_lock = TRANSCRIPTION_REQUEST_LOCKS.get(task_id)
+    if request_lock:
+        request_lock.acquire()
+    try:
+        with TRANSCRIPTION_LOCK:
+            task = TRANSCRIPTION_TASKS.get(task_id)
+            if task is None:
+                raise KeyError("没有找到这个转写任务。")
+            if task.get("status") not in TRANSCRIPTION_ACTIVE_STATUSES:
+                raise ValueError("这个转写任务已经结束。")
+            if task.get("cancel_requested"):
+                return public_transcription(dict(task))
+            task["cancel_requested"] = True
+            task["stage"] = "正在取消"
+            task["stage_started_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            persist_transcription(task)
+            snapshot = dict(task)
+            cancel_event = TRANSCRIPTION_CANCEL_EVENTS.get(task_id)
+            service = TRANSCRIPTION_SERVICES.get(task_id)
+    finally:
+        if request_lock:
+            request_lock.release()
+    if cancel_event:
+        cancel_event.set()
+
+    with MIMO_QUEUE_CONDITION:
+        was_queued = task_id in MIMO_QUEUE
+        if was_queued:
+            MIMO_QUEUE.remove(task_id)
+        is_active_mimo = MIMO_ACTIVE_TASK_ID == task_id
+        MIMO_QUEUE_CONDITION.notify_all()
+
+    asr_task_id = str(snapshot.get("asr_task_id") or "")
+    if asr_task_id:
+        with TRANSCRIPTION_LOCK:
+            current = TRANSCRIPTION_TASKS.get(task_id)
+            if current:
+                current["asr_cancel_sent"] = True
+                persist_transcription(current)
+        delete_asr_job(asr_task_id)
+    download_task_id = str(snapshot.get("download_task_id") or "")
+    if service and download_task_id:
+        try:
+            service.request(f"/api/v1/tasks/{urllib.parse.quote(download_task_id, safe='')}/stop", "POST", {})
+        except Exception as error:
+            LOG.warning("停止转写音频下载失败 task_id=%s error=%s", task_id, redact(error))
+
+    if was_queued or (snapshot.get("status") == "queued" and not is_active_mimo and not snapshot.get("asr_task_id")):
+        cancelled = mark_transcription_cancelled(task_id)
+        refresh_mimo_queue_positions()
+        return public_transcription(cancelled or snapshot)
+    return public_transcription(snapshot)
+
+
+def new_transcription_task(source: dict, *, parent_id: str | None = None, filename: str = "", provider_override: str | None = None, model_override: str | None = None) -> dict:
     task_id = secrets.token_hex(12)
     title = str(source.get("title") or "未命名视频")
     name = f"{title} · {filename}" if filename else title
     provider, details = transcription_provider_settings()
+    if provider_override in TRANSCRIPTION_PROVIDERS:
+        provider = provider_override
+    model = model_override or TRANSCRIPTION_PROVIDERS[provider]["model"]
     task = {
         "task_id": task_id,
         "name": name,
@@ -946,7 +1170,10 @@ def new_transcription_task(source: dict, *, parent_id: str | None = None, filena
         "finished_at": "",
         "parent_id": parent_id,
         "provider": provider,
-        "model": details["model"],
+        "model": model,
+        "cancel_requested": False,
+        "stage_started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "request_attempt": 0,
         "pages": [str(page) for page in source.get("pages", []) if str(page).isdigit()],
         "all_pages": bool(source.get("all_pages")),
         "audio_path": "",
@@ -955,6 +1182,8 @@ def new_transcription_task(source: dict, *, parent_id: str | None = None, filena
     }
     with TRANSCRIPTION_LOCK:
         TRANSCRIPTION_TASKS[task_id] = task
+        TRANSCRIPTION_CANCEL_EVENTS[task_id] = threading.Event()
+        TRANSCRIPTION_REQUEST_LOCKS[task_id] = threading.Lock()
         persist_transcription(task)
     return task
 
@@ -1092,16 +1321,19 @@ def transcription_audio_files(directory: Path) -> list[Path]:
 def run_local_transcription_audio(task_id: str, audio_path: Path) -> None:
     asr_task_id = ""
     try:
+        check_transcription_cancelled(task_id)
         with TRANSCRIPTION_LOCK:
             source_title = str(TRANSCRIPTION_TASKS.get(task_id, {}).get("source_title") or "未命名视频")
         update_transcription(task_id, status="uploading", stage="提交本地转写服务", progress=40, filename=audio_path.name, name=f"{source_title} · {audio_path.name}")
         status, health = asr_json("/health")
         if status != HTTPStatus.OK or not isinstance(health, dict) or health.get("ready") is not True:
             raise RuntimeError(asr_error_message(health, "本地转写服务未就绪。"))
+        check_transcription_cancelled(task_id)
         payload = asr_upload(audio_path)
         asr_task_id = str(payload["task_id"])
         update_transcription(task_id, asr_task_id=asr_task_id, status="queued", stage="排队中", progress=45)
         while True:
+            check_transcription_cancelled(task_id)
             status, current = asr_json(f"/v1/jobs/{urllib.parse.quote(asr_task_id, safe='')}")
             if status != HTTPStatus.OK or not isinstance(current, dict):
                 raise RuntimeError(asr_error_message(current, "无法读取本地转写任务状态。"))
@@ -1119,15 +1351,23 @@ def run_local_transcription_audio(task_id: str, audio_path: Path) -> None:
                 update_transcription(task_id, status="succeeded", stage="转写完成", progress=100, result=result, finished_at=datetime.now().isoformat(timespec="seconds"))
                 return
             elif current_status in {"failed", "cancelled"}:
+                if current_status == "cancelled" and transcription_cancel_requested(task_id):
+                    raise TranscriptionCancelled("转写任务已取消。")
                 raise RuntimeError(asr_error_message(current, "本地转写服务未完成任务。"))
             else:
                 raise RuntimeError(f"本地转写服务返回未知状态：{current_status or '空'}")
             time.sleep(1)
+    except TranscriptionCancelled:
+        mark_transcription_cancelled(task_id)
     except Exception as error:
         update_transcription(task_id, status="failed", stage="转写失败", progress=0, error=short_error(error), finished_at=datetime.now().isoformat(timespec="seconds"))
     finally:
         if asr_task_id:
-            delete_asr_job(asr_task_id)
+            with TRANSCRIPTION_LOCK:
+                task = TRANSCRIPTION_TASKS.get(task_id) or {}
+                cancel_sent = bool(task.get("asr_cancel_sent"))
+            if not cancel_sent:
+                delete_asr_job(asr_task_id)
 
 
 def run_transcription_audio(task_id: str, audio_path: Path) -> None:
@@ -1138,12 +1378,23 @@ def run_transcription_audio(task_id: str, audio_path: Path) -> None:
     if provider == "local":
         run_local_transcription_audio(task_id, audio_path)
         return
+    acquired = False
     try:
-        progress_callback = lambda progress, stage: update_transcription(task_id, status="processing", stage=stage, progress=progress)
-        result = mimo_transcribe_audio(audio_path, audio_path.parent / "mimo", provider, model, progress_callback)
+        acquire_mimo_queue(task_id)
+        acquired = True
+        check_transcription_cancelled(task_id)
+        def progress_callback(progress: int, stage: str) -> None:
+            update_transcription(task_id, status="processing", stage=stage, progress=progress)
+        result = mimo_transcribe_audio(audio_path, audio_path.parent / "mimo", provider, model, progress_callback, task_id)
+        check_transcription_cancelled(task_id)
         update_transcription(task_id, status="succeeded", stage="转写完成", progress=100, result=result, finished_at=datetime.now().isoformat(timespec="seconds"))
+    except TranscriptionCancelled:
+        mark_transcription_cancelled(task_id)
     except Exception as error:
         update_transcription(task_id, status="failed", stage="转写失败", progress=0, error=short_error(error), finished_at=datetime.now().isoformat(timespec="seconds"))
+    finally:
+        if acquired:
+            release_mimo_queue(task_id)
 
 
 def run_manual_transcription(task_id: str, audio_path: Path, temp_dir: Path) -> None:
@@ -1152,13 +1403,19 @@ def run_manual_transcription(task_id: str, audio_path: Path, temp_dir: Path) -> 
         run_transcription_audio(task_id, audio_path)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        with TRANSCRIPTION_LOCK:
+            TRANSCRIPTION_CANCEL_EVENTS.pop(task_id, None)
+            TRANSCRIPTION_REQUEST_LOCKS.pop(task_id, None)
 
 
 def run_transcription_pipeline(task_id: str, source: dict) -> None:
     temp_dir = transcription_root() / task_id
     service = BBDownService()
     service.respect_config = False
+    with TRANSCRIPTION_LOCK:
+        TRANSCRIPTION_SERVICES[task_id] = service
     try:
+        check_transcription_cancelled(task_id)
         update_transcription(task_id, status="downloading", stage="正在获取音频", progress=5)
         status, health = asr_json("/health")
         if status != HTTPStatus.OK or not isinstance(health, dict) or health.get("ready") is not True:
@@ -1167,6 +1424,7 @@ def run_transcription_pipeline(task_id: str, source: dict) -> None:
         ok, message = service.ensure_started(str(temp_dir), respect_config=False)
         if not ok:
             raise RuntimeError(message)
+        check_transcription_cancelled(task_id)
         request_data = {
             "url": source["url"],
             "pages": ",".join(source.get("pages") or []) if source.get("pages") else "all",
@@ -1181,6 +1439,7 @@ def run_transcription_pipeline(task_id: str, source: dict) -> None:
         download_task_id = str(result["id"])
         update_transcription(task_id, download_task_id=download_task_id)
         while True:
+            check_transcription_cancelled(task_id)
             status, current = service.request(f"/api/v1/tasks/{urllib.parse.quote(download_task_id, safe='')}")
             if status >= 300 or not isinstance(current, dict):
                 raise RuntimeError("无法读取音频下载任务状态。")
@@ -1199,18 +1458,40 @@ def run_transcription_pipeline(task_id: str, source: dict) -> None:
         if not audio_files:
             raise RuntimeError("音频下载完成但未找到音频文件。")
         for index, audio_path in enumerate(audio_files):
+            check_transcription_cancelled(task_id)
             if index == 0:
                 target_id = task_id
             else:
-                child = new_transcription_task(source, parent_id=task_id, filename=audio_path.name)
+                with TRANSCRIPTION_LOCK:
+                    parent_task = dict(TRANSCRIPTION_TASKS.get(task_id) or {})
+                child = new_transcription_task(
+                    source,
+                    parent_id=task_id,
+                    filename=audio_path.name,
+                    provider_override=str(parent_task.get("provider") or "local"),
+                    model_override=str(parent_task.get("model") or ""),
+                )
                 target_id = child["task_id"]
             update_transcription(target_id, name=f"{source.get('title') or '未命名视频'} · {audio_path.name}", filename=audio_path.name, audio_path=str(audio_path))
             run_transcription_audio(target_id, audio_path)
+    except TranscriptionCancelled:
+        mark_transcription_cancelled(task_id)
     except Exception as error:
-        update_transcription(task_id, status="failed", stage="转写失败", progress=0, error=short_error(error), finished_at=datetime.now().isoformat(timespec="seconds"))
+        if transcription_cancel_requested(task_id):
+            mark_transcription_cancelled(task_id)
+        else:
+            update_transcription(task_id, status="failed", stage="转写失败", progress=0, error=short_error(error), finished_at=datetime.now().isoformat(timespec="seconds"))
     finally:
         service.stop()
         shutil.rmtree(temp_dir, ignore_errors=True)
+        with TRANSCRIPTION_LOCK:
+            TRANSCRIPTION_SERVICES.pop(task_id, None)
+            TRANSCRIPTION_CANCEL_EVENTS.pop(task_id, None)
+            TRANSCRIPTION_REQUEST_LOCKS.pop(task_id, None)
+            for child_id, task in TRANSCRIPTION_TASKS.items():
+                if task.get("parent_id") == task_id:
+                    TRANSCRIPTION_CANCEL_EVENTS.pop(child_id, None)
+                    TRANSCRIPTION_REQUEST_LOCKS.pop(child_id, None)
 
 
 def start_transcription(source: dict) -> dict:
@@ -1956,6 +2237,15 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         try:
+            cancel_match = re.fullmatch(r"/api/transcriptions/([a-f0-9]{24})/cancel", path)
+            if cancel_match:
+                try:
+                    self.send_json({"item": cancel_transcription(cancel_match.group(1))})
+                except KeyError as error:
+                    self.send_json({"error": short_error(error)}, HTTPStatus.NOT_FOUND)
+                except ValueError as error:
+                    self.send_json({"error": short_error(error)}, HTTPStatus.CONFLICT)
+                return
             if path == "/api/transcriptions/manual":
                 self.handle_manual_transcription_upload()
                 return

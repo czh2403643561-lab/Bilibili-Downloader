@@ -320,6 +320,21 @@ const AUTO_ASR_STATUS = { downloading: '获取音频中', uploading: '提交转�
 const ASR_ACTIVE_STATUSES = new Set(['queued', 'downloading', 'uploading', 'processing']);
 function activeAutomaticTask() { return state.asr.tasks.find((task) => task.task_id === state.asr.activeTaskId) || null; }
 function currentAsrResult() { const task = activeAutomaticTask(); return task ? task.result : state.asr.result; }
+function asrTaskStageText(task) {
+  if (task.cancel_requested) return '正在取消';
+  const stage = String(task.stage || '');
+  if (task.status !== 'processing' || !/^正在转写第 \d+\/\d+ 段/.test(stage)) return stage;
+  const started = Date.parse(task.stage_started_at || '');
+  const elapsed = Number.isFinite(started) ? Math.max(0, Math.floor((Date.now() - started) / 1000)) : 0;
+  const attempt = Number(task.request_attempt || 0);
+  return `${stage}${attempt > 1 ? ` · 第 ${attempt} 次请求` : ''} · 已等待 ${elapsed} 秒`;
+}
+function refreshAsrWaitLabels() {
+  document.querySelectorAll('[data-asr-wait]').forEach((label) => {
+    const task = { status: label.dataset.status, stage: label.dataset.stage, stage_started_at: label.dataset.startedAt, request_attempt: label.dataset.attempt, cancel_requested: label.dataset.cancelRequested === 'true' };
+    label.textContent = asrTaskStageText(task);
+  });
+}
 function renderAutomaticTasks() {
   const container = $('#asr-task-list'); if (!container) return;
   $('#asr-manage-toggle').classList.toggle('hidden', state.asr.manageMode);
@@ -331,8 +346,10 @@ function renderAutomaticTasks() {
     const done = task.status === 'succeeded';
     const running = ASR_ACTIVE_STATUSES.has(task.status);
     const model = task.provider === 'local' ? '本地 FunASR' : task.model;
+    const stage = asrTaskStageText(task);
     const checkbox = state.asr.manageMode ? `<input class="asr-task-select" type="checkbox" data-asr-select="${escapeHtml(task.task_id)}" aria-label="选择 ${escapeHtml(task.name || '转写任务')}" ${state.asr.selectedTaskIds.includes(task.task_id) ? 'checked' : ''} ${running ? 'disabled title="任务运行中，不能删除"' : ''}>` : '';
-    return `<article class="asr-task ${task.task_id === state.asr.activeTaskId ? 'active' : ''} ${state.asr.manageMode ? 'managing' : ''}" data-asr-task="${escapeHtml(task.task_id)}"><div class="asr-task-main"><div class="task-top"><span class="task-name">${escapeHtml(task.name || task.source_title || '转写任务')}</span><span class="task-status ${failed ? 'failed' : done ? 'done' : ''}">${escapeHtml(AUTO_ASR_STATUS[task.status] || task.status || '等待中')}</span></div><div class="task-progress"><span style="width:${done ? 100 : progress}%"></span></div><div class="task-meta"><span>${escapeHtml(model || '')}</span><span>${escapeHtml(task.stage || '')}</span><span>进度：${done ? 100 : progress}%</span></div>${task.error ? `<div class="task-error">${escapeHtml(task.error)}</div>` : ''}</div>${checkbox}</article>`;
+    const cancelButton = running ? `<button class="secondary asr-task-cancel" data-asr-cancel="${escapeHtml(task.task_id)}" ${task.cancel_requested ? 'disabled' : ''}>${task.cancel_requested ? '正在取消…' : '取消'}</button>` : '';
+    return `<article class="asr-task ${task.task_id === state.asr.activeTaskId ? 'active' : ''} ${state.asr.manageMode ? 'managing' : ''}" data-asr-task="${escapeHtml(task.task_id)}"><div class="asr-task-main"><div class="task-top"><span class="task-name">${escapeHtml(task.name || task.source_title || '转写任务')}</span><span class="task-status ${failed ? 'failed' : done ? 'done' : ''}">${escapeHtml(AUTO_ASR_STATUS[task.status] || task.status || '等待中')}</span></div><div class="task-progress"><span style="width:${done ? 100 : progress}%"></span></div><div class="task-meta"><span>${escapeHtml(model || '')}</span><span data-asr-wait data-status="${escapeHtml(task.status || '')}" data-stage="${escapeHtml(task.stage || '')}" data-started-at="${escapeHtml(task.stage_started_at || '')}" data-attempt="${escapeHtml(task.request_attempt || 0)}" data-cancel-requested="${Boolean(task.cancel_requested)}">${escapeHtml(stage)}</span><span>进度：${done ? 100 : progress}%</span></div>${task.error ? `<div class="task-error">${escapeHtml(task.error)}</div>` : ''}</div>${cancelButton}${checkbox}</article>`;
   }).join('');
 }
 function renderAsr() {
@@ -347,7 +364,7 @@ function renderAsr() {
     const hasRealProgress = Number.isFinite(job.progress);
     $('#asr-status-title').textContent = automatic ? (AUTO_ASR_STATUS[job.status] || '转写任务') : copy[0];
     $('#asr-status-detail').textContent = errorText || (hasRealProgress ? `${copy[1]} · 进度：${job.progress}%` : copy[1]);
-    if (automatic) $('#asr-status-detail').textContent = errorText || `${job.stage || ''} · 进度：${job.progress}%`;
+    if (automatic) $('#asr-status-detail').textContent = errorText || `${asrTaskStageText(job)} · 进度：${job.progress}%`;
     $('#asr-cancel').classList.toggle('hidden', Boolean(automatic) || !['queued', 'processing'].includes(job.status));
     $('#asr-progress').classList.toggle('hidden', !hasRealProgress);
     $('#asr-progress-text').classList.toggle('hidden', !hasRealProgress);
@@ -396,6 +413,14 @@ async function startAsr() {
   } catch (error) { asrMessage(error.message); renderAsr(); }
 }
 async function cancelAsr() { if (!state.asr.job) return; try { state.asr.job = await AsrClient.cancelJob(state.asr.job.task_id); stopAsrPolling(); } catch (error) { if (error.status === 409) asrMessage('任务已开始转写，当前不能中断。'); else asrMessage(error.message); } renderAsr(); }
+async function cancelTranscriptionTask(taskId) {
+  const task = state.asr.tasks.find((item) => item.task_id === taskId);
+  if (!task || !ASR_ACTIVE_STATUSES.has(task.status) || task.cancel_requested) return;
+  if (!window.confirm('确定取消此转写任务？已经提交给云端的当前片段可能仍产生费用，但后续片段会停止。')) return;
+  task.cancel_requested = true; task.stage = '正在取消'; task.stage_started_at = new Date().toISOString(); renderAsr();
+  try { await api(`/api/transcriptions/${encodeURIComponent(taskId)}/cancel`, { method: 'POST', body: '{}' }); await refreshTranscriptionTasks(); }
+  catch (error) { await refreshTranscriptionTasks(); asrMessage(error.message); }
+}
 async function copyAsrText() { try { await navigator.clipboard.writeText(currentAsrResult()?.text || ''); asrMessage('全文已复制。'); } catch (_) { asrMessage('无法自动复制，请手动选择文字稿。'); } }
 function exportAsrText() { const result = currentAsrResult(); if (!result) return; const blob = new Blob([result.text || ''], { type: 'text/plain;charset=utf-8' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `${activeAutomaticTask()?.name || asrFileName()}.txt`.replace(/[\\/:*?"<>|]/g, '_'); link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 0); }
 function setAsrTaskSelected(taskId, selected) {
@@ -453,9 +478,9 @@ function bindEvents() {
   $('#asr-clear-all').addEventListener('click', clearTranscriptionHistory); $('#asr-delete-selected').addEventListener('click', deleteSelectedTranscriptions);
   $('#asr-select-all').addEventListener('click', () => { state.asr.selectedTaskIds = state.asr.tasks.filter((task) => !ASR_ACTIVE_STATUSES.has(task.status)).map((task) => task.task_id); renderAsr(); });
   $('#asr-task-list').addEventListener('change', (event) => { const checkbox = event.target.closest('[data-asr-select]'); if (!checkbox) return; setAsrTaskSelected(checkbox.dataset.asrSelect, checkbox.checked); renderAsr(); });
-  $('#asr-task-list').addEventListener('click', (event) => { const task = event.target.closest('[data-asr-task]'); if (!task || state.asr.manageMode || event.target.closest('[data-asr-select]')) return; state.asr.activeTaskId = task.dataset.asrTask; renderAsr(); });
+  $('#asr-task-list').addEventListener('click', (event) => { const cancel = event.target.closest('[data-asr-cancel]'); if (cancel) { event.preventDefault(); event.stopPropagation(); cancelTranscriptionTask(cancel.dataset.asrCancel); return; } const task = event.target.closest('[data-asr-task]'); if (!task || state.asr.manageMode || event.target.closest('[data-asr-select]')) return; state.asr.activeTaskId = task.dataset.asrTask; renderAsr(); });
   $('#transcription-provider').addEventListener('change', () => { $('#mimo-key-row').classList.toggle('hidden', $('#transcription-provider').value === 'local'); }); $('#transcription-save').addEventListener('click', saveTranscriptionSettings);
   $('#asr-file').addEventListener('change', (event) => setAsrFile(event.target.files?.[0])); $('#asr-new-file').addEventListener('click', () => $('#asr-file').click()); $('#asr-start').addEventListener('click', startAsr); $('#asr-cancel').addEventListener('click', cancelAsr);
   $('#asr-copy').addEventListener('click', copyAsrText); $('#asr-export-txt').addEventListener('click', exportAsrText);
 }
-setupNavigation(); bindEvents(); renderAsr(); renderTranscriptionSettings(); refreshHealth(); refreshLoginStatus(); checkAsrHealth(); refreshTranscriptionSettings(); refreshTranscriptionTasks(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000); setInterval(refreshTranscriptionTasks, 1000);
+setupNavigation(); bindEvents(); renderAsr(); renderTranscriptionSettings(); refreshHealth(); refreshLoginStatus(); checkAsrHealth(); refreshTranscriptionSettings(); refreshTranscriptionTasks(); setInterval(refreshHealth, 3000); setInterval(refreshTasks, 1000); setInterval(refreshTranscriptionTasks, 1000); setInterval(refreshAsrWaitLabels, 1000);
