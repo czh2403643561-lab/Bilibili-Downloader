@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "在当前已登录的浏览器中为 CourseFlow 解析腾讯会议回放。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAne35ySpLfcL5as6UqC6Cgqf8BExBUNQhfqskBCZwhg8Czoov0hPEzrWijFsnlPY5+A81pUKyCXOvfkYXiSICt6uJRPHBd1tlbeuchtR8U1H4PXUmPeefro39MKoohyq8xPdh1AmN4MVt6uGpptxuluywaMU4WG+hVg6p8GtHvEWXW5buPtSjhFRwc5Dc5QOW1y7i6oFMCGZnoszdZyNmPebuqxOUM4d0TnT93G4I5VD17lJVWRBMoqAE7RDX/gPklHEAYQIndd3D4DcQba3qNcjW6s4RrqGOM8MoNa3+N4hQ2dE5jRgf1DO0pXSH9r+ATgGiPTX5G9lsuKwbAhxU6wIDAQAB",
-  "permissions": ["alarms", "cookies", "tabs", "webRequest"],
+  "permissions": ["alarms", "cookies", "storage", "tabs", "webRequest"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "https://meeting.tencent.com/*",

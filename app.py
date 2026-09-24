@@ -2128,8 +2128,12 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
-        if MEETING_BRIDGE.origin_allowed(origin):
-            self.send_header("Access-Control-Allow-Origin", origin)
+        response_origin = MEETING_BRIDGE.request_origin(
+            self.headers.get("X-CourseFlow-Extension-Id"),
+            self.headers.get("X-CourseFlow-Extension-Browser"), origin,
+        )
+        if response_origin:
+            self.send_header("Access-Control-Allow-Origin", response_origin)
             self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(raw)
@@ -2150,6 +2154,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def bridge_authorized(self) -> bool:
         return MEETING_BRIDGE.authorized(
+            self.headers.get("X-CourseFlow-Extension-Id"),
+            self.headers.get("X-CourseFlow-Extension-Browser"),
             self.headers.get("Origin"),
             self.headers.get("X-CourseFlow-Bridge-Token"),
         )
@@ -2162,19 +2168,25 @@ class Handler(SimpleHTTPRequestHandler):
             for item in self.headers.get("Access-Control-Request-Headers", "").split(",")
             if item.strip()
         }
-        allowed_headers = {"content-type", "x-courseflow-bridge-token"}
+        allowed_headers = {
+            "content-type", "x-courseflow-bridge-token",
+            "x-courseflow-extension-id", "x-courseflow-extension-browser",
+        }
+        origin_ok = origin is None or MEETING_BRIDGE.origin_allowed(origin)
         if (
             not self.path.startswith("/api/meeting-bridge/")
-            or not MEETING_BRIDGE.origin_allowed(origin)
+            or not origin_ok
+            or not {"x-courseflow-extension-id", "x-courseflow-extension-browser"}.issubset(requested_headers)
             or requested_method not in {"GET", "POST"}
             or not requested_headers.issubset(allowed_headers)
         ):
             self.send_error(HTTPStatus.FORBIDDEN)
             return
         self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Access-Control-Allow-Origin", origin)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-CourseFlow-Bridge-Token")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-CourseFlow-Bridge-Token, X-CourseFlow-Extension-Id, X-CourseFlow-Extension-Browser")
         self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Vary", "Origin")
         self.send_header("Content-Length", "0")
@@ -2248,7 +2260,12 @@ class Handler(SimpleHTTPRequestHandler):
             elif path == "/api/meeting-bridge/pair":
                 origin = self.headers.get("Origin")
                 try:
-                    self.send_bridge_json(MEETING_BRIDGE.pair(origin), origin=origin)
+                    result = MEETING_BRIDGE.pair(
+                        self.headers.get("X-CourseFlow-Extension-Id"),
+                        self.headers.get("X-CourseFlow-Extension-Browser"),
+                        origin,
+                    )
+                    self.send_bridge_json(result, origin=origin)
                 except PermissionError:
                     self.send_bridge_json({"error": "浏览器扩展来源未获授权。"}, HTTPStatus.FORBIDDEN, origin)
             elif path == "/api/meeting-bridge/tasks/next":
@@ -2257,14 +2274,22 @@ class Handler(SimpleHTTPRequestHandler):
                     self.send_bridge_json({"error": "浏览器桥接鉴权失败。"}, HTTPStatus.FORBIDDEN, origin)
                 else:
                     try:
-                        task = MEETING_BRIDGE.claim_next(origin, self.headers.get("X-CourseFlow-Bridge-Token"))
+                        task = MEETING_BRIDGE.claim_next(
+                            self.headers.get("X-CourseFlow-Extension-Id"),
+                            self.headers.get("X-CourseFlow-Extension-Browser"), origin,
+                            self.headers.get("X-CourseFlow-Bridge-Token"),
+                        )
                     except PermissionError:
                         self.send_bridge_json({"error": "浏览器桥接鉴权失败。"}, HTTPStatus.FORBIDDEN, origin)
                     else:
                         if task is None:
                             self.send_response(HTTPStatus.NO_CONTENT)
-                            if MEETING_BRIDGE.origin_allowed(origin):
-                                self.send_header("Access-Control-Allow-Origin", origin)
+                            response_origin = MEETING_BRIDGE.request_origin(
+                                self.headers.get("X-CourseFlow-Extension-Id"),
+                                self.headers.get("X-CourseFlow-Extension-Browser"), origin,
+                            )
+                            if response_origin:
+                                self.send_header("Access-Control-Allow-Origin", response_origin)
                                 self.send_header("Vary", "Origin")
                             self.send_header("Content-Length", "0")
                             self.end_headers()
@@ -2353,7 +2378,11 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 try:
                     payload = self.read_bridge_json()
-                    result = MEETING_BRIDGE.heartbeat(origin, self.headers.get("X-CourseFlow-Bridge-Token"), payload)
+                    result = MEETING_BRIDGE.heartbeat(
+                        self.headers.get("X-CourseFlow-Extension-Id"),
+                        self.headers.get("X-CourseFlow-Extension-Browser"), origin,
+                        self.headers.get("X-CourseFlow-Bridge-Token"), payload,
+                    )
                     self.send_bridge_json(result, origin=origin)
                 except ValueError as error:
                     self.send_bridge_json({"error": short_error(error)}, HTTPStatus.BAD_REQUEST, origin)
@@ -2371,7 +2400,8 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 try:
                     result = MEETING_BRIDGE.finish(
-                        bridge_result_match.group(1), origin,
+                        bridge_result_match.group(1), self.headers.get("X-CourseFlow-Extension-Id"),
+                        self.headers.get("X-CourseFlow-Extension-Browser"), origin,
                         self.headers.get("X-CourseFlow-Bridge-Token"), payload,
                     )
                 except KeyError as error:
@@ -2390,7 +2420,8 @@ class Handler(SimpleHTTPRequestHandler):
                 try:
                     payload = self.read_bridge_json()
                     result = MEETING_BRIDGE.update_progress(
-                        bridge_progress_match.group(1), origin,
+                        bridge_progress_match.group(1), self.headers.get("X-CourseFlow-Extension-Id"),
+                        self.headers.get("X-CourseFlow-Extension-Browser"), origin,
                         self.headers.get("X-CourseFlow-Bridge-Token"), payload.get("stage"),
                     )
                 except KeyError as error:

@@ -1,7 +1,6 @@
-importScripts("title_utils.js", "bridge_core.js");
+importScripts("title_utils.js", "bridge_core.js", "bridge_client.js");
 
 const API_BASE = "http://127.0.0.1:23666/api/meeting-bridge";
-const BRIDGE_VERSION = "0.1.0";
 const HEARTBEAT_INTERVAL_MS = 5000;
 const PAGE_TIMEOUT_MS = 45000;
 const MEDIA_TIMEOUT_MS = 20000;
@@ -9,11 +8,22 @@ const MEDIA_HOSTS = ["tencent.com", "qcloud.com", "myqcloud.com", "tencent-cloud
 const mediaContexts = new Map();
 const pendingRequests = new Map();
 
-let bridgeToken = "";
 let busy = false;
 let activeWorker = null;
 let heartbeatTimer = null;
 let workerStage = "idle";
+let previousDiagnosticState = "unknown";
+
+const bridgeClient = CourseFlowBridgeClient.createBridgeClient({
+  apiBase: API_BASE,
+  extensionId: chrome.runtime.id,
+  browser: /Edg\//u.test(navigator.userAgent) ? "edge" : "chrome",
+  saveDiagnostic: (diagnostic) => chrome.storage.session.set({ bridgeDiagnostic: diagnostic }).catch(() => {})
+});
+
+void chrome.storage.session.get("bridgeDiagnostic").then(({ bridgeDiagnostic }) => {
+  bridgeClient.restoreDiagnostic(bridgeDiagnostic);
+});
 
 function hostAllowed(hostname) {
   const host = String(hostname || "").toLowerCase();
@@ -44,44 +54,18 @@ function requestKey(url) {
   } catch { return String(url); }
 }
 
-function ensureToken(force = false) {
-  if (bridgeToken && !force) return Promise.resolve(bridgeToken);
-  return fetch(`${API_BASE}/pair`, { cache: "no-store" })
-    .then(async (response) => {
-      if (!response.ok) throw new Error("pair rejected");
-      const payload = await response.json();
-      if (typeof payload.token !== "string" || !payload.token) throw new Error("pair invalid");
-      bridgeToken = payload.token;
-      return bridgeToken;
-    });
-}
+function bridgeFetch(path, options = {}) { return bridgeClient.request(path, options); }
 
-async function bridgeFetch(path, options = {}, retry = true) {
-  const token = await ensureToken();
-  const headers = new Headers(options.headers || {});
-  headers.set("X-CourseFlow-Bridge-Token", token);
-  if (options.body) headers.set("Content-Type", "application/json");
-  const response = await fetch(`${API_BASE}${path}`, { ...options, headers, cache: "no-store" });
-  if (response.status === 403 && retry) {
-    bridgeToken = "";
-    await ensureToken(true);
-    return bridgeFetch(path, options, false);
-  }
-  if (response.status === 204) return null;
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(`bridge HTTP ${response.status}`);
-  return payload;
-}
-
-function browserName() {
-  return /Edg\//u.test(navigator.userAgent) ? "edge" : "chrome";
+function logDiagnosticTransition() {
+  const diagnostic = bridgeClient.getDiagnostic();
+  if (diagnostic.state === previousDiagnosticState) return;
+  const statusPart = diagnostic.http_status ? ` status=${diagnostic.http_status}` : "";
+  console.warn(`[CourseFlow Bridge] ${diagnostic.state}${statusPart}`);
+  previousDiagnosticState = diagnostic.state;
 }
 
 async function heartbeat() {
-  await bridgeFetch("/heartbeat", {
-    method: "POST",
-    body: JSON.stringify({ version: BRIDGE_VERSION, browser: browserName() })
-  });
+  await bridgeClient.heartbeat();
 }
 
 async function readNextTask() {
@@ -256,7 +240,8 @@ async function execute(task) {
 
 async function pollAndRun() {
   if (busy) {
-    try { await heartbeat(); } catch { /* 下一次 tick 自动重连。 */ }
+    try { await heartbeat(); } catch { /* 状态由 bridge client 安全记录。 */ }
+    logDiagnosticTransition();
     return;
   }
   busy = true;
@@ -268,12 +253,18 @@ async function pollAndRun() {
       await heartbeat();
     });
     workerStage = "idle";
-  } catch { /* 不把错误、任务地址或敏感请求上下文写入控制台。下次 tick 自动重连。 */ }
-  finally { busy = false; }
+  } catch {
+    bridgeClient.reportUnexpectedFailure();
+  }
+  finally {
+    busy = false;
+    logDiagnosticTransition();
+  }
 }
 
 function schedulePolling() {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
+  void chrome.alarms.create("courseflow-meeting-bridge", { periodInMinutes: 0.5 });
   heartbeatTimer = setInterval(() => { void pollAndRun(); }, HEARTBEAT_INTERVAL_MS);
   void pollAndRun();
 }
@@ -309,7 +300,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
 });
 
-chrome.alarms.create("courseflow-meeting-bridge", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "courseflow-meeting-bridge") void pollAndRun();
 });
@@ -317,10 +307,21 @@ chrome.runtime.onStartup.addListener(schedulePolling);
 chrome.runtime.onInstalled.addListener(schedulePolling);
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "bridgePopupStatus") {
-    fetch(`${API_BASE}/status`, { cache: "no-store" })
-      .then((response) => response.ok ? response.json() : { connected: false })
-      .then((status) => sendResponse({ ...status, workerActive: Boolean(activeWorker), stage: activeWorker?.stage || workerStage }))
-      .catch(() => sendResponse({ connected: false, workerActive: Boolean(activeWorker), stage: activeWorker?.stage || workerStage }));
+    bridgeClient.getStatus()
+      .then((status) => sendResponse({
+        ...status,
+        version: chrome.runtime.getManifest().version,
+        browser: bridgeClient.getDiagnostic().browser || (/Edg\//u.test(navigator.userAgent) ? "edge" : "chrome"),
+        extension_id: chrome.runtime.id,
+        workerActive: Boolean(activeWorker),
+        stage: activeWorker?.stage || workerStage,
+        last_success_relative: status.last_success_at ? "最近已成功" : "尚无成功连接"
+      }))
+      .catch(() => sendResponse({ ...bridgeClient.getDiagnostic(), connected: false, extension_id: chrome.runtime.id }));
+    return true;
+  }
+  if (message?.type === "bridgeReconnect") {
+    bridgeClient.reconnect().then((status) => sendResponse({ ...status, extension_id: chrome.runtime.id }));
     return true;
   }
   return false;

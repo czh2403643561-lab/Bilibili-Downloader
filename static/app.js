@@ -70,10 +70,10 @@ async function refreshMeetingStatus() {
     state.meeting.connected = Boolean(bridge.connected);
     $('#meeting-bridge-settings-status').textContent = bridge.connected
       ? `浏览器插件已连接${bridge.browser ? `（${bridge.browser === 'edge' ? 'Edge' : 'Chrome'}）` : ''}`
-      : '未检测到 CourseFlow 浏览器插件';
+      : state.online ? '未连接' : '连接异常';
     $('#meeting-parse').disabled = !bridge.connected;
     if (!state.meeting.taskId) {
-      $('#meeting-message').textContent = bridge.connected ? '' : '未检测到 CourseFlow 浏览器插件。请在 Chrome 或 Edge 中启用桥接扩展。';
+      $('#meeting-message').textContent = bridge.connected ? '' : '浏览器插件未连接。请确认扩展已启用；如果仍未连接，点击插件中的“重新连接”。';
       return;
     }
     const task = await api(`/api/meeting-bridge/tasks/${state.meeting.taskId}`);

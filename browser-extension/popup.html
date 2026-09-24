@@ -9,9 +9,15 @@
 <body>
   <main>
     <h1>CourseFlow Bridge</h1>
-    <p id="connection" class="status">正在检查本地服务…</p>
+    <p id="connection" class="status">正在检查桥接状态…</p>
+    <p id="details" class="details"></p>
     <p class="hint">腾讯会议：请在当前浏览器中正常登录。</p>
+    <button id="reconnect" class="secondary" type="button">重新连接</button>
     <button id="open-courseflow" type="button">打开 CourseFlow</button>
+    <details>
+      <summary>诊断信息</summary>
+      <p id="diagnostic"></p>
+    </details>
   </main>
   <script src="popup.js"></script>
 </body>

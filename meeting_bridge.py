@@ -95,6 +95,7 @@ class MeetingBridgeService:
     """Keeps tasks, bridge credentials and captured media context in process memory only."""
 
     def __init__(self, extension_id: str, clock=time.time):
+        self.extension_id = extension_id
         self.extension_origins = {
             f"chrome-extension://{extension_id}",
             f"edge-extension://{extension_id}",
@@ -114,24 +115,34 @@ class MeetingBridgeService:
     def origin_allowed(self, origin: str | None) -> bool:
         return isinstance(origin, str) and any(secrets.compare_digest(origin, allowed) for allowed in self.extension_origins)
 
-    def pair(self, origin: str | None) -> dict[str, str]:
-        if not self.origin_allowed(origin):
+    def request_origin(self, extension_id: str | None, browser: str | None, origin: str | None) -> str | None:
+        if not isinstance(extension_id, str) or not secrets.compare_digest(extension_id, self.extension_id):
+            return None
+        if browser not in {"chrome", "edge"}:
+            return None
+        expected = f"{browser}-extension://{self.extension_id}"
+        if origin is not None and not secrets.compare_digest(origin, expected):
+            return None
+        return expected
+
+    def pair(self, extension_id: str | None, browser: str | None, origin: str | None) -> dict[str, str]:
+        if not self.request_origin(extension_id, browser, origin):
             raise PermissionError("浏览器扩展来源未获授权。")
         return {"token": self._token, "version": BRIDGE_VERSION}
 
-    def authorized(self, origin: str | None, token: str | None) -> bool:
+    def authorized(self, extension_id: str | None, browser: str | None, origin: str | None, token: str | None) -> bool:
         return (
-            self.origin_allowed(origin)
+            self.request_origin(extension_id, browser, origin) is not None
             and isinstance(token, str)
             and len(token) <= 128
             and secrets.compare_digest(token, self._token)
         )
 
-    def heartbeat(self, origin: str | None, token: str | None, payload: Any) -> dict[str, Any]:
-        if not self.authorized(origin, token):
+    def heartbeat(self, extension_id: str | None, browser_header: str | None, origin: str | None, token: str | None, payload: Any) -> dict[str, Any]:
+        if not self.authorized(extension_id, browser_header, origin, token):
             raise PermissionError("浏览器桥接鉴权失败。")
         browser = payload.get("browser") if isinstance(payload, dict) else None
-        if not isinstance(payload, dict) or not isinstance(browser, str) or browser not in {"chrome", "edge"}:
+        if not isinstance(payload, dict) or not isinstance(browser, str) or browser != browser_header:
             raise ValueError("浏览器桥接状态无效。")
         version = payload.get("version")
         if not isinstance(version, str) or not version or len(version) > 32:
@@ -179,8 +190,8 @@ class MeetingBridgeService:
             self._tasks[task_id] = task
             return self._public_task(task)
 
-    def claim_next(self, origin: str | None, token: str | None) -> dict[str, str] | None:
-        if not self.authorized(origin, token):
+    def claim_next(self, extension_id: str | None, browser: str | None, origin: str | None, token: str | None) -> dict[str, str] | None:
+        if not self.authorized(extension_id, browser, origin, token):
             raise PermissionError("浏览器桥接鉴权失败。")
         now = self._clock()
         with self._lock:
@@ -196,8 +207,8 @@ class MeetingBridgeService:
             self._active_task_id = task["task_id"]
             return {"task_id": task["task_id"], "url": task["url"]}
 
-    def update_progress(self, task_id: str, origin: str | None, token: str | None, stage: Any) -> dict[str, Any]:
-        if not self.authorized(origin, token):
+    def update_progress(self, task_id: str, extension_id: str | None, browser: str | None, origin: str | None, token: str | None, stage: Any) -> dict[str, Any]:
+        if not self.authorized(extension_id, browser, origin, token):
             raise PermissionError("浏览器桥接鉴权失败。")
         if not isinstance(stage, str) or stage not in TASK_STAGES:
             raise ValueError("解析阶段无效。")
@@ -213,8 +224,8 @@ class MeetingBridgeService:
             task["lease_expires_at"] = now + ACTIVE_TASK_TTL_SECONDS
             return self._public_task(task)
 
-    def finish(self, task_id: str, origin: str | None, token: str | None, payload: Any) -> dict[str, Any]:
-        if not self.authorized(origin, token):
+    def finish(self, task_id: str, extension_id: str | None, browser: str | None, origin: str | None, token: str | None, payload: Any) -> dict[str, Any]:
+        if not self.authorized(extension_id, browser, origin, token):
             raise PermissionError("浏览器桥接鉴权失败。")
         if not isinstance(payload, dict):
             raise ValueError("解析结果无效。")
