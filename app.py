@@ -706,6 +706,27 @@ def mimo_audio_chunks(audio_path: Path, temp_dir: Path, provider: str) -> list[P
     raise RuntimeError("音频切片后仍超过 MiMo 单次请求限制。")
 
 
+def split_mimo_chunk(chunk: Path, temp_dir: Path, segment_seconds: int) -> list[Path]:
+    executable = ffmpeg_executable()
+    if executable is None:
+        raise RuntimeError("缺少 FFmpeg，无法缩小 MiMo 音频片段。")
+    retry_dir = temp_dir / f"{chunk.stem}-retry-{segment_seconds}"
+    retry_dir.mkdir(parents=True, exist_ok=True)
+    output_pattern = str(retry_dir / "chunk-%05d.mp3")
+    command = [
+        str(executable), "-hide_banner", "-loglevel", "error", "-y", "-i", str(chunk),
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k",
+        "-f", "segment", "-segment_time", str(segment_seconds), "-reset_timestamps", "1", output_pattern,
+    ]
+    result = subprocess.run(command, cwd=ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800, check=False)
+    if result.returncode != 0:
+        raise RuntimeError("FFmpeg 无法缩小 MiMo 音频片段。")
+    chunks = sorted(retry_dir.glob("chunk-*.mp3"))
+    if len(chunks) < 2:
+        raise RuntimeError(f"音频片段不足约 {segment_seconds} 秒，无法继续缩小重试。")
+    return chunks
+
+
 def mimo_response_text(payload: object) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -768,10 +789,9 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
     if progress_callback:
         progress_callback(15, f"音频准备完成，共 {len(chunks)} 段")
     texts = []
-    for index, chunk in enumerate(chunks, 1):
+
+    def transcribe_chunk(chunk: Path, index: int, retry_depth: int = 0) -> str:
         check_transcription_cancelled(task_id) if task_id else None
-        if progress_callback:
-            progress_callback(20 + round(70 * (index - 1) / len(chunks)), f"正在转写第 {index}/{len(chunks)} 段")
         encoded = base64.b64encode(chunk.read_bytes()).decode("ascii")
         mime = mimetypes.guess_type(chunk.name)[0] or "audio/mpeg"
         audio_data = f"data:{mime};base64,{encoded}"
@@ -786,49 +806,63 @@ def mimo_transcribe_audio(audio_path: Path, temp_dir: Path, provider: str, model
                 "thinking": {"type": "disabled"},
                 "max_completion_tokens": 65536,
             }
-        try:
-            def report_attempt(attempt: int) -> None:
-                if task_id:
-                    check_transcription_cancelled(task_id)
-                if progress_callback:
-                    progress_callback(20 + round(70 * (index - 1) / len(chunks)), f"正在转写第 {index}/{len(chunks)} 段")
-                    update_transcription(task_id, status="processing", request_attempt=attempt)
+        retry_stage = (
+            f"正在重试第 {index}/{len(chunks)} 段的约 {300 if retry_depth == 1 else 150} 秒片段"
+            if retry_depth else f"正在转写第 {index}/{len(chunks)} 段"
+        )
+        def report_attempt(attempt: int) -> None:
+            if task_id:
+                check_transcription_cancelled(task_id)
+            if progress_callback:
+                progress_callback(20 + round(70 * (index - 1) / len(chunks)), retry_stage)
+                update_transcription(task_id, status="processing", request_attempt=attempt)
 
-            status, response = mimo_request(
-                "/chat/completions", api_key, payload,
-                task_id=task_id, provider=provider, model=model, chunk_index=index, chunk_total=len(chunks),
-                chunk_bytes=chunk.stat().st_size,
-                cancellation_check=(lambda: check_transcription_cancelled(task_id)) if task_id else None,
-                cancel_event=TRANSCRIPTION_CANCEL_EVENTS.get(task_id) if task_id else None,
-                request_lock=TRANSCRIPTION_REQUEST_LOCKS.get(task_id) if task_id else None,
-                attempt_callback=report_attempt,
-            )
-            check_transcription_cancelled(task_id) if task_id else None
-            metadata = mimo_response_metadata(response)
-            if status < 200 or status >= 300:
-                raise RuntimeError(asr_error_message(response, f"MiMo 第 {index}/{len(chunks)} 个音频片段请求失败。"))
-            finish_reason = metadata["finish_reason"]
-            if finish_reason in {"length", "max_tokens"}:
-                raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 个音频片段输出达到 token 上限（finish_reason={finish_reason}）。")
-            if finish_reason not in {None, "stop"}:
-                raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 个音频片段返回异常（finish_reason={finish_reason}）。")
-            text = mimo_response_text(response)
-            if not text:
-                LOG.warning(
-                    "MiMo empty content provider=%s model=%s chunk=%s/%s bytes=%s status=%s finish_reason=%s usage=%s content_chars=%s reasoning_content_chars=%s",
-                    provider,
-                    model,
-                    index,
-                    len(chunks),
-                    chunk.stat().st_size,
-                    status,
-                    metadata["finish_reason"],
-                    metadata["usage"],
-                    metadata["content_chars"],
-                    metadata["reasoning_content_chars"],
+        status, response = mimo_request(
+            "/chat/completions", api_key, payload,
+            task_id=task_id, provider=provider, model=model, chunk_index=index, chunk_total=len(chunks),
+            chunk_bytes=chunk.stat().st_size,
+            cancellation_check=(lambda: check_transcription_cancelled(task_id)) if task_id else None,
+            cancel_event=TRANSCRIPTION_CANCEL_EVENTS.get(task_id) if task_id else None,
+            request_lock=TRANSCRIPTION_REQUEST_LOCKS.get(task_id) if task_id else None,
+            attempt_callback=report_attempt,
+        )
+        check_transcription_cancelled(task_id) if task_id else None
+        metadata = mimo_response_metadata(response)
+        if status < 200 or status >= 300:
+            raise RuntimeError(asr_error_message(response, f"MiMo 第 {index}/{len(chunks)} 个音频片段请求失败。"))
+        finish_reason = metadata["finish_reason"]
+        if finish_reason == "content_filter" and provider == "mimo-v2.6-flash":
+            retry_durations = (300, 150)
+            if retry_depth >= len(retry_durations):
+                raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 段缩小至约 150 秒后仍被内容过滤（finish_reason=content_filter）。")
+            next_seconds = retry_durations[retry_depth]
+            if progress_callback:
+                progress_callback(
+                    20 + round(70 * (index - 1) / len(chunks)),
+                    f"第 {index}/{len(chunks)} 段触发内容过滤，正在缩小片段重试（约 {next_seconds} 秒）",
                 )
-                raise RuntimeError("MiMo 返回空文字稿。")
-            texts.append(text)
+            smaller_chunks = split_mimo_chunk(chunk, temp_dir, next_seconds)
+            return "\n".join(transcribe_chunk(smaller, index, retry_depth + 1) for smaller in smaller_chunks)
+        if finish_reason in {"length", "max_tokens"}:
+            raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 个音频片段输出达到 token 上限（finish_reason={finish_reason}）。")
+        if finish_reason not in {None, "stop"}:
+            raise RuntimeError(f"MiMo 第 {index}/{len(chunks)} 个音频片段返回异常（finish_reason={finish_reason}）。")
+        text = mimo_response_text(response)
+        if not text:
+            LOG.warning(
+                "MiMo empty content provider=%s model=%s chunk=%s/%s bytes=%s status=%s finish_reason=%s usage=%s content_chars=%s reasoning_content_chars=%s",
+                provider, model, index, len(chunks), chunk.stat().st_size, status, metadata["finish_reason"],
+                metadata["usage"], metadata["content_chars"], metadata["reasoning_content_chars"],
+            )
+            raise RuntimeError("MiMo 返回空文字稿。")
+        return text
+
+    for index, chunk in enumerate(chunks, 1):
+        check_transcription_cancelled(task_id) if task_id else None
+        if progress_callback:
+            progress_callback(20 + round(70 * (index - 1) / len(chunks)), f"正在转写第 {index}/{len(chunks)} 段")
+        try:
+            texts.append(transcribe_chunk(chunk, index))
         except TranscriptionCancelled:
             raise
         except Exception as error:
